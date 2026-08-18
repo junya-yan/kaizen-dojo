@@ -62,6 +62,33 @@ npm run dev                    # http://localhost:3000
 
 ---
 
+## デプロイ
+
+### GitHub Pages（静的エクスポート・採点なし）
+
+`main` に push すると `.github/workflows/deploy-pages.yml` が動き、GitHub Pages に自動デプロイされます
+（リポジトリ設定の Settings → Pages → Build and deployment → Source を **GitHub Actions** にしておくこと。
+初回はここだけ手動での有効化が必要）。
+
+GitHub Pages は静的ホスティングのみで、`/api/grade` が必要とするサーバーは動かせません。
+このワークフローは `src/app/api` を**CIのチェックアウト上でのみ**取り除いてから
+`next build` を静的エクスポートモード（`NEXT_STATIC_EXPORT=true`）で実行します。
+コミットされているソースは変更されないので、後述のVercelデプロイには影響しません。
+
+採点ボタンは押すとAPIが存在せず失敗しますが、既存のエラーハンドリングにより
+自動的に「採点基準を見る」自己採点モード（採点基準と模範解答の表示）にフォールバックします。
+四択・記述の演習、進捗の保存（localStorage）は通常どおり動きます。
+
+手動で試したい場合は Actions タブから `Deploy to GitHub Pages` を `workflow_dispatch` で実行できます。
+
+### Vercel（採点つきのフル機能）
+
+記述式のAI採点まで含めてデプロイするなら Vercel を使ってください。
+このリポジトリを Import し、`ANTHROPIC_API_KEY` を環境変数に設定するだけで、
+コードの変更なしにそのままデプロイできます（Next.js の App Router / API Routes をそのまま利用）。
+
+---
+
 ## 構成
 
 ```
