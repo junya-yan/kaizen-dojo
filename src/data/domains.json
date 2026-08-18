@@ -1,0 +1,474 @@
+[
+  {
+    "id": "review",
+    "no": "01",
+    "name": "コードレビュー",
+    "lead": "テストが通ったコードから、まだ表に出ていない綻びを見つける。",
+    "questions": [
+      {
+        "id": "rev-1",
+        "type": "mcq",
+        "severity": "Major",
+        "situation": "社内の管理画面に「注文一覧」を追加するPR。ステージングの注文データは30件で、一覧は即座に表示された。単体テストもE2Eも通っている。",
+        "code": "// GET /admin/orders\nasync function listOrders(req, res) {\n  const orders = await db.order.findMany({\n    where: { status: \"paid\" },\n    orderBy: { createdAt: \"desc\" },\n  });\n\n  const rows = [];\n  for (const order of orders) {\n    const customer = await db.customer.findUnique({ where: { id: order.customerId } });\n    const items = await db.orderItem.findMany({ where: { orderId: order.id } });\n    rows.push({\n      id: order.id,\n      customerName: customer.name,\n      itemCount: items.length,\n      total: order.total,\n    });\n  }\n\n  res.json({ rows });\n}",
+        "prompt": "このコードを本番に出す前に、レビューで最も強く指摘すべきことは何か。",
+        "choices": [
+          "`orderBy` に複合インデックスが無いので、並び順が不定になる",
+          "注文1件ごとに追加のクエリが2回走るので、件数が増えるとレスポンスが線形に悪化する",
+          "`res.json` の前に `try/catch` が無いので、例外時に500が返らない",
+          "`rows` を `const` ではなく `let` で宣言すべきである"
+        ],
+        "answer": 1,
+        "explanation": "注文がN件あると、顧客取得でN回、明細取得でN回、合わせて 2N+1 回のクエリが発行される（N+1問題）。ステージングの30件では60msでも、本番で5,000件あれば1万回のクエリになり、DBの接続プールを食い潰して一覧以外のAPIまで巻き込んで遅くなる。JOINするか、`in` 句で顧客と明細をまとめて取得して、メモリ上で突き合わせる。件数の上限が読めない一覧APIにはページネーションも要る。",
+        "principle": "ループの中でI/Oを呼んでいたら、件数が10倍になったときの挙動を必ず問う。手元で速いことは、本番で速いことの証明にならない。"
+      },
+      {
+        "id": "rev-2",
+        "type": "free",
+        "severity": "Major",
+        "situation": "決済完了後に領収書メールを送る処理。「メール送信が失敗しても決済自体は成功させたい」という要件があり、実装者は例外を握りつぶした。テストは通り、手元でも決済は完了する。",
+        "code": "async function completePayment(orderId) {\n  const order = await db.order.update({\n    where: { id: orderId },\n    data: { status: \"paid\", paidAt: new Date() },\n  });\n\n  try {\n    await mailer.sendReceipt(order.customerEmail, order);\n  } catch (e) {\n    // メール送信の失敗で決済を止めたくない\n  }\n\n  return order;\n}",
+        "prompt": "この `catch` の何が問題か、そして「決済は止めない」という要件を満たしたまま、どう直すべきか。あなたがレビューコメントとして書く内容をそのまま書いてください。",
+        "rubric": [
+          "例外を握りつぶすと、送信失敗が誰にも観測されない（ログもメトリクスも残らない）ことを指摘している",
+          "問い合わせが来て初めて気づく状態になる、という運用面の影響に触れている",
+          "最低限、エラーログの記録（orderIdなどの特定に必要な情報つき）を求めている",
+          "リトライまたは非同期キューへの退避など、送信を後から再実行できる設計を提案している",
+          "捕捉する例外の範囲を絞る（メール送信由来の失敗だけを飲み込み、プログラミングエラーは通す）観点がある",
+          "アラート・監視につなげる、あるいは失敗件数を可視化する提案がある",
+          "「決済は止めない」という元の要件を壊さない直し方になっている"
+        ]
+      },
+      {
+        "id": "rev-3",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "イベントの座席予約API。残席を確認してから予約を作る。手動テストでは正しく動き、残席0のときはきちんと弾かれる。",
+        "code": "async function reserveSeat(eventId, userId) {\n  const event = await db.event.findUnique({ where: { id: eventId } });\n\n  if (event.remainingSeats <= 0) {\n    throw new Error(\"SOLD_OUT\");\n  }\n\n  await db.reservation.create({ data: { eventId, userId } });\n  await db.event.update({\n    where: { id: eventId },\n    data: { remainingSeats: event.remainingSeats - 1 },\n  });\n}",
+        "prompt": "このコードが本番で引き起こす、最も重い障害はどれか。",
+        "choices": [
+          "`findUnique` が null を返したときに TypeError で落ちる",
+          "同じユーザーが2回押すと予約が2件できる",
+          "同時に複数のリクエストが来ると、残席が0未満になり定員を超えて予約が成立する",
+          "`remainingSeats` の更新が失敗しても予約レコードが残る"
+        ],
+        "answer": 2,
+        "explanation": "確認（read）と更新（write）が別のトランザクションに分かれているため、2つのリクエストが同時に残席1を読むと、両方とも条件を通過して2件予約が成立する。残席は-1になる。1リクエストずつ手で叩くテストでは絶対に再現しない。DB側で `UPDATE ... SET remaining_seats = remaining_seats - 1 WHERE id = ? AND remaining_seats > 0` のように、条件つきの原子的な更新にして、更新行数が0なら売り切れとして扱う。予約作成と在庫減算は同一トランザクションに入れる。選択肢1・2・4も直すべき欠陥だが、定員超過ほど取り返しがつかないものではない。",
+        "principle": "「読んで、判断して、書く」が分かれている箇所は、その間に他人が割り込む前提で読む。判断の根拠と書き込みは同じ原子的操作にまとめる。"
+      },
+      {
+        "id": "rev-4",
+        "type": "mcq",
+        "severity": "Major",
+        "situation": "「フッターの著作権表記の年を更新する」という説明のPR。差分を開くと、文言以外の変更が混ざっている。CIは緑で、レビュアーは自分ひとり。",
+        "code": "--- a/src/components/Footer.tsx\n+++ b/src/components/Footer.tsx\n-      <small>© 2024 Kaizen Inc.</small>\n+      <small>© 2025 Kaizen Inc.</small>\n\n--- a/src/lib/payment.ts\n+++ b/src/lib/payment.ts\n-const RETRY_LIMIT = 3;\n-const RETRY_BACKOFF_MS = 1000;\n+const RETRY_LIMIT = 10;\n+const RETRY_BACKOFF_MS = 100;\n\n--- a/src/lib/payment.ts\n+++ b/src/lib/payment.ts\n-  timeout: 30_000,\n+  timeout: 5_000,",
+        "prompt": "レビュアーとして、どう対応するのが最も適切か。",
+        "choices": [
+          "CIが通っていて文言修正も正しいので、そのまま承認する",
+          "決済のリトライ設定は自分の担当外なので、文言部分だけ確認して承認し、決済の変更は決済担当に後で伝える",
+          "決済まわりの変更をこのPRから外すよう依頼し、変更理由・影響範囲・切り戻し手順を伴う別PRとして出してもらう",
+          "リトライ回数だけ元に戻すようコメントし、タイムアウトの変更は許容する"
+        ],
+        "answer": 2,
+        "explanation": "PRの説明と差分の中身が一致していない時点で問題。決済のリトライを3回→10回、バックオフを1秒→0.1秒、タイムアウトを30秒→5秒にする変更は、決済プロバイダへの瞬間的な負荷を10倍以上にし、5秒で切られた決済が「アプリ上は失敗、実際は成立」という二重課金の温床になる。これは文言修正のついでに通してよい変更ではない。「担当外だから見ない」（選択肢2）は、承認という行為が持つ責任を放棄している。承認する以上、差分全体に責任が伴う。分離を求めれば、その変更は本来必要なレビュー（決済担当・影響範囲・切り戻し）を受けられる。",
+        "principle": "PRの説明と差分の中身が食い違ったら、まず分離を求める。承認は「読んだ」の意思表示ではなく「責任を共有する」の意思表示である。"
+      },
+      {
+        "id": "rev-5",
+        "type": "free",
+        "severity": "Major",
+        "situation": "チームがAIコーディングエージェントを本格導入した。1日に届くPRが3件から20件に増え、どれも動作し、テストも付いていて、説明文も丁寧に書かれている。レビュアーの人数は変わらない。全部を今までと同じ密度で読むのは物理的に無理だと分かってきた。",
+        "prompt": "AI生成PRを安全に取り込むために、レビューの方針をどう変えるか。「何を重点的に見て、何を仕組みに任せるか」を、理由とともに書いてください。",
+        "rubric": [
+          "全PRを均一な密度で読むのをやめ、変更の影響範囲（認証・認可・決済・個人情報・マイグレーション・課金など）でレビュー深度を変える方針を示している",
+          "機械が確実に判定できること（フォーマット、Lint、型、テスト実行、依存の脆弱性、カバレッジ低下）はCIに任せる、と切り分けている",
+          "人間が見るべき対象を「意図と設計の妥当性」に寄せている（そもそもこの変更は必要か、この抽象は正しいか、要件を満たしているか）",
+          "AI生成コード特有のリスクに触れている（もっともらしいが要件からずれる、テストが実装に追従して書かれ検証になっていない、既存の類似実装を再利用せず重複を生む、依存を勝手に増やす、など）",
+          "テストが「実装をなぞっただけ」になっていないかを確認する観点を挙げている",
+          "PRの粒度を小さく保つ、1PR1目的を強制するなど、レビュー可能性を担保するルールに言及している",
+          "最終的な責任の所在（マージした人・承認した人が責任を持つ）を明確にしている",
+          "スループットのために品質ゲートを下げる方向ではなく、ゲートを機械化して人の注意を希少な判断に集中させる方向になっている"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "db",
+    "no": "02",
+    "name": "データベース設計",
+    "lead": "今日は正しく動くスキーマが、半年後にどんな嘘をつくかを読む。",
+    "questions": [
+      {
+        "id": "db-1",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "ECサイトの注文テーブル。金額はすべて円で扱う。ステージングでは合計金額も表示され、テストの期待値とも一致している。",
+        "code": "CREATE TABLE orders (\n  id          BIGSERIAL PRIMARY KEY,\n  user_id     BIGINT NOT NULL,\n  subtotal    DOUBLE PRECISION NOT NULL,\n  tax         DOUBLE PRECISION NOT NULL,\n  total       DOUBLE PRECISION NOT NULL,\n  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n);\n\n-- 集計\nSELECT user_id, SUM(total) AS lifetime_value\nFROM orders\nGROUP BY user_id;",
+        "prompt": "この設計が本番で起こす問題として、最も深刻なものはどれか。",
+        "choices": [
+          "`DOUBLE PRECISION` は2進浮動小数点なので、加算を繰り返すと1円単位の誤差が積み上がり、会計上の数字が合わなくなる",
+          "`BIGSERIAL` は将来的に枯渇するので `UUID` にすべきである",
+          "`TIMESTAMPTZ` ではなく `TIMESTAMP` を使うべきである",
+          "`SUM` に対するインデックスが無いので集計が遅い"
+        ],
+        "answer": 0,
+        "explanation": "`DOUBLE PRECISION` は2進浮動小数点で、10進の小数を正確に表現できない。円のような整数運用でも、税計算で小数が生じ、`SUM` を数万件重ねれば誤差が見える桁に浮き上がる。「1円合わない」は経理と顧客対応の両方に跳ね返り、しかも過去データを遡って直す必要が出る。金額は `NUMERIC(precision, scale)` にするか、最小単位（円・セント）の整数で保持する。通貨を複数扱う可能性があるなら、通貨コードの列も同時に持たせる。",
+        "principle": "お金・数量・率のように「合わないと事故になる数値」に浮動小数点を使わない。丸め方と最小単位を、型の段階で決めきる。"
+      },
+      {
+        "id": "db-2",
+        "type": "mcq",
+        "severity": "Major",
+        "situation": "記事にタグを付ける機能。タグはカンマ区切りの文字列で1列に持たせた。記事の作成・表示・タグ検索はすべて動作し、テストも通っている。",
+        "code": "CREATE TABLE articles (\n  id     BIGSERIAL PRIMARY KEY,\n  title  TEXT NOT NULL,\n  body   TEXT NOT NULL,\n  tags   TEXT NOT NULL DEFAULT ''   -- 例: 'react,testing,performance'\n);\n\n-- タグ検索\nSELECT * FROM articles WHERE tags LIKE '%react%';",
+        "prompt": "この持ち方で、運用が始まってから最初に致命傷になるのはどこか。",
+        "choices": [
+          "`TEXT` 型は長さ制限が無いため、巨大な文字列が入るとディスクを圧迫する",
+          "`LIKE '%react%'` は 'react-native' や 'preact' にも一致し、インデックスも効かないため、検索が誤り、かつ遅くなる",
+          "`DEFAULT ''` があるので `NOT NULL` は不要である",
+          "タグの数が3つを超えると文字列が読みにくくなる"
+        ],
+        "answer": 1,
+        "explanation": "部分一致は部分文字列にすぎず、タグの境界を理解しない。'react' の検索が 'preact' の記事を拾い、'react-native' も混ざる。前方ワイルドカードのため B-tree インデックスも使えず、全件走査になる。さらに、タグ名の変更（'testing' → 'test'）は全行のUPDATEになり、タグ一覧やタグ別件数の集計も文字列分解を強いられる。`tags` マスタと `article_tags` 中間テーブルに正規化すれば、参照整合性・一意性・索引・集計がすべてDB側の保証で手に入る。",
+        "principle": "1つの列に複数の値を詰めた時点で、その値には制約も索引も効かなくなる。区切り文字は設計の放棄のサインとして読む。"
+      },
+      {
+        "id": "db-3",
+        "type": "free",
+        "severity": "Major",
+        "situation": "会員登録機能。メールアドレスの重複はアプリ側でチェックしており、ステージングでは同じアドレスで2回登録しようとするとちゃんとエラーになる。テストも通っている。",
+        "code": "-- スキーマ\nCREATE TABLE users (\n  id      BIGSERIAL PRIMARY KEY,\n  email   TEXT NOT NULL,\n  name    TEXT NOT NULL\n);\n\n-- アプリケーション側\nasync function register({ email, name }) {\n  const existing = await db.user.findFirst({ where: { email } });\n  if (existing) {\n    throw new Error(\"EMAIL_TAKEN\");\n  }\n  return db.user.create({ data: { email, name } });\n}",
+        "prompt": "この実装のどこにリスクがあり、どう直すべきか。DB側とアプリケーション側の両方について書いてください。",
+        "rubric": [
+          "確認と挿入の間に他のリクエストが割り込むと重複行が作られる（競合状態）ことを指摘している",
+          "同時実行だけでなく、バッチ投入・データ移行・管理画面など、このコードを通らない経路からも重複が入りうることに触れている",
+          "`email` に UNIQUE 制約（または UNIQUE インデックス）を張ることを、根本の対策として挙げている",
+          "大文字小文字・前後の空白の正規化、あるいは CITEXT／関数インデックスなど、一意性の判定基準を明示している",
+          "アプリ側は事前チェックを残しつつ、挿入時の一意制約違反を捕捉して同じエラーに変換する（DBを最後の砦にする）設計になっている",
+          "既に重複データが入っている可能性があるため、制約追加の前に既存データの調査・名寄せが必要だと述べている",
+          "「アプリで守れているから大丈夫」という前提そのものを否定できている"
+        ]
+      },
+      {
+        "id": "db-4",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "注文明細テーブル。商品IDだけを持ち、金額や商品名は表示時に products テーブルをJOINして引いている。注文履歴画面は正しく表示され、テストも通っている。",
+        "code": "CREATE TABLE products (\n  id     BIGSERIAL PRIMARY KEY,\n  name   TEXT NOT NULL,\n  price  NUMERIC(12,2) NOT NULL\n);\n\nCREATE TABLE order_items (\n  id          BIGSERIAL PRIMARY KEY,\n  order_id    BIGINT NOT NULL REFERENCES orders(id),\n  product_id  BIGINT NOT NULL REFERENCES products(id),\n  quantity    INT NOT NULL\n);\n\n-- 注文履歴の表示\nSELECT p.name, p.price, oi.quantity, p.price * oi.quantity AS line_total\nFROM order_items oi\nJOIN products p ON p.id = oi.product_id\nWHERE oi.order_id = $1;",
+        "prompt": "この設計で、運用が始まってから何が壊れるか。",
+        "choices": [
+          "商品が増えるとJOINが遅くなり、注文履歴の表示に時間がかかる",
+          "商品の価格や名前を変更した瞬間、過去の注文履歴の金額と商品名まで書き換わってしまう",
+          "`quantity` に CHECK 制約が無いため、負の数量が入りうる",
+          "`NUMERIC(12,2)` では高額商品の桁が足りない"
+        ],
+        "answer": 1,
+        "explanation": "注文は「その時いくらで買ったか」という事実の記録であり、商品マスタは「今いくらで売っているか」という現在の状態である。両者を参照で結ぶと、値上げした瞬間に過去の領収書の金額が変わる。返金額の計算も、売上集計も、顧客に発行済みの領収書とも食い違う。商品が削除されれば履歴自体が引けなくなる。`order_items` に購入時点の `product_name` と `unit_price`（および税率）をコピーして保存する。ここでの非正規化は冗長ではなく、履歴の不変性という要件そのものである。選択肢3も直すべきだが、履歴汚染ほど広範囲には効かない。",
+        "principle": "履歴は「その時点の事実」を自分で保持する。現在の状態を指す参照で履歴を組み立てると、マスタの更新が過去を書き換える。"
+      },
+      {
+        "id": "db-5",
+        "type": "free",
+        "severity": "Major",
+        "situation": "社内の学習管理ツールに「受講者が複数の講座を受講でき、講座には複数の受講者がいる」機能を追加する。実装者は下のスキーマを出してきた。手元では受講登録も一覧表示も動いている。",
+        "code": "CREATE TABLE users (\n  id            BIGSERIAL PRIMARY KEY,\n  name          TEXT NOT NULL,\n  course_ids    TEXT           -- 例: '3,7,12'\n);\n\nCREATE TABLE courses (\n  id            BIGSERIAL PRIMARY KEY,\n  title         TEXT NOT NULL,\n  student_count INT NOT NULL DEFAULT 0\n);",
+        "prompt": "この多対多の持ち方の問題点を挙げ、あなたならどんなスキーマにするかをDDLで示し、その理由を説明してください。「受講開始日」「進捗率」のような、関係そのものが持つ属性も扱えるようにしてください。",
+        "rubric": [
+          "カンマ区切りのIDでは外部キー制約が張れず、存在しない講座IDを参照できてしまうことを指摘している",
+          "`student_count` がアプリ側の更新に依存する冗長データであり、実データとずれる（削除・失敗時に不整合が残る）ことに触れている",
+          "中間テーブル（例: enrollments）を導入する解を、実際のDDLで示している",
+          "中間テーブルに (user_id, course_id) の複合主キーまたは UNIQUE 制約を置き、重複受講を防いでいる",
+          "両側の外部キーに ON DELETE の方針（CASCADE／RESTRICT）を明示している",
+          "関係の属性（enrolled_at、progress、status など）を中間テーブルの列として持たせている",
+          "検索方向に応じたインデックス（course_id 側の索引など）に言及している",
+          "受講者数は COUNT で導出する、あるいは集計を持つならDB側で一貫性を担保する（トリガ・マテビュー）と述べている"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "security",
+    "no": "03",
+    "name": "認証・セキュリティ",
+    "lead": "正しく動く認証ほど、破られ方が見えにくい。",
+    "questions": [
+      {
+        "id": "sec-1",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "自前のユーザー認証。パスワードは平文で持たず、ハッシュ化して保存している。ログイン・登録ともに動作し、テストも通っている。",
+        "code": "import crypto from \"node:crypto\";\n\nfunction hashPassword(password) {\n  return crypto.createHash(\"sha256\").update(password).digest(\"hex\");\n}\n\nasync function login(email, password) {\n  const user = await db.user.findUnique({ where: { email } });\n  if (!user) return null;\n  if (user.passwordHash !== hashPassword(password)) return null;\n  return user;\n}",
+        "prompt": "このハッシュ方式の、最も重大な問題はどれか。",
+        "choices": [
+          "SHA-256 は既に解読されており、ハッシュから平文を復元できる",
+          "ソルトが無く、かつ SHA-256 は高速なため、DBが漏れた場合に総当たり・レインボーテーブルで大量のパスワードが短時間で割られる",
+          "`digest(\"hex\")` ではなく `digest(\"base64\")` を使うべきである",
+          "ハッシュ値の比較に `!==` を使っているのでタイミング攻撃が成立する"
+        ],
+        "answer": 1,
+        "explanation": "SHA-256 は「速いこと」が長所の汎用ハッシュで、パスワード保護には向かない。GPUなら毎秒数十億回試行でき、ソルトが無ければ同じパスワードのユーザーが同じハッシュになるので、1回の解析で全員ぶんが割れる。既存のレインボーテーブルもそのまま使える。ユーザーごとにランダムなソルトを持ち、計算コストを調整できる Argon2id（次点で bcrypt / scrypt）を使う。選択肢4のタイミング差も実在する問題だが、ここでは総当たり耐性の欠如のほうが桁違いに重い（両方直すのが正解）。",
+        "principle": "パスワードのハッシュには「遅くて、ソルトがあって、コストを上げられる」専用アルゴリズムを使う。汎用ハッシュの速さは、そのまま攻撃者の速さになる。"
+      },
+      {
+        "id": "sec-2",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "請求書のダウンロードAPI。ログインしていないと 401 が返る。ログイン中のユーザーは自分の請求書を問題なくダウンロードでき、テストも通っている。",
+        "code": "// GET /api/invoices/:id\nrouter.get(\"/api/invoices/:id\", requireLogin, async (req, res) => {\n  const invoice = await db.invoice.findUnique({\n    where: { id: Number(req.params.id) },\n  });\n\n  if (!invoice) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n\n  res.json(invoice);\n});",
+        "prompt": "このエンドポイントに残っている穴はどれか。",
+        "choices": [
+          "`Number()` の変換に失敗すると NaN がクエリに渡る",
+          "ログインさえしていれば、URLのIDを書き換えるだけで他人の請求書を取得できる",
+          "404 を返すことで請求書の存在有無が漏れる",
+          "レスポンスに `Cache-Control` が無いのでブラウザにキャッシュされる"
+        ],
+        "answer": 1,
+        "explanation": "`requireLogin` が保証しているのは「誰かであること（認証）」だけで、「その請求書を見てよい人であること（認可）」は誰も確認していない。IDは連番なので、`/api/invoices/1041` を `1042` に変えれば他人の請求書が取れる。これは IDOR（安全でない直接オブジェクト参照）と呼ばれ、実際の情報漏洩事故で最も頻出する型のひとつ。自分のアカウントでは常に自分のIDしか送らないので、通常のテストでは絶対に露見しない。クエリの時点で所有者条件を含める（`where: { id, ownerId: req.user.id }`）のが基本形。選択肢1・3・4も直す価値はあるが、他人のデータが読める穴とは重さが違う。",
+        "principle": "認証は「誰か」を、認可は「その人がこの資源に触れてよいか」を答える。IDを受け取るエンドポイントでは、必ず所有者条件を問い合わせに埋め込む。"
+      },
+      {
+        "id": "sec-3",
+        "type": "mcq",
+        "severity": "Major",
+        "situation": "SPAのログイン処理。サーバーから受け取ったJWTを localStorage に保存し、以降のリクエストに Authorization ヘッダで付けている。動作もテストも問題ない。",
+        "code": "async function login(email, password) {\n  const res = await fetch(\"/api/login\", {\n    method: \"POST\",\n    headers: { \"Content-Type\": \"application/json\" },\n    body: JSON.stringify({ email, password }),\n  });\n  const { token } = await res.json();\n  localStorage.setItem(\"auth_token\", token);\n}\n\nfunction authHeader() {\n  return { Authorization: `Bearer ${localStorage.getItem(\"auth_token\")}` };\n}",
+        "prompt": "この保管方法の主なリスクとして正しいものはどれか。",
+        "choices": [
+          "localStorage は容量が5MBしかないため、トークンが長いと保存に失敗する",
+          "localStorage はJavaScriptから読めるため、XSSが1箇所でも成立するとトークンごと盗まれ、攻撃者がそのユーザーとして振る舞える",
+          "localStorage はタブを閉じると消えるため、ログイン状態が維持できない",
+          "Authorization ヘッダは平文で送られるため、通信経路上で盗聴される"
+        ],
+        "answer": 1,
+        "explanation": "localStorage は同一オリジンのあらゆるスクリプトから読める。自社コードだけでなく、依存パッケージ・広告タグ・アナリティクスも含まれる。XSSが1箇所でも成立すれば、`localStorage.getItem(\"auth_token\")` の1行でトークンが外部へ送られ、有効期限が切れるまで攻撃者がそのユーザーとして振る舞える。`HttpOnly` + `Secure` + `SameSite` を付けた Cookie に置けばJavaScriptからは読めなくなる（代わりにCSRF対策が要る）。加えて、アクセストークンの寿命を短くし、リフレッシュトークンを分けて失効可能にする。選択肢3は誤り（localStorage は永続、sessionStorage がタブ単位）。選択肢4もHTTPSで解決済み。",
+        "principle": "トークンの保管場所は「XSSが起きた時に何を失うか」で選ぶ。JavaScriptから読める場所に置いた資格情報は、XSSと同時に失われる前提で設計する。"
+      },
+      {
+        "id": "sec-4",
+        "type": "free",
+        "severity": "Critical",
+        "situation": "社内向けのファイル共有ツールに、新規ワークスペース作成機能を追加した。作成直後にすぐ使い始められるよう、初期設定は「何も制限しない」状態にしてある。動作確認では作成も共有も問題なく、テストも通っている。",
+        "code": "async function createWorkspace({ name, ownerId }) {\n  return db.workspace.create({\n    data: {\n      name,\n      ownerId,\n      visibility: \"public\",        // 誰でも閲覧可能\n      allowExternalShare: true,    // 社外への共有リンク発行を許可\n      defaultMemberRole: \"admin\",  // 招待された人はまず管理者\n      retentionDays: null,         // 保持期限なし\n      auditLogEnabled: false,      // 監査ログは必要になったら有効化\n    },\n  });\n}",
+        "prompt": "このデフォルト設定の何が危険か、そしてどう変えるべきかを、設定ごとに理由を添えて書いてください。",
+        "rubric": [
+          "デフォルト値は大多数のユーザーがそのまま使う、という前提を踏まえている",
+          "`visibility: \"public\"` を既定にすると、意図せず社外・全社に公開されたワークスペースが生まれることを指摘している",
+          "`defaultMemberRole: \"admin\"` が最小権限の原則に反しており、招待された全員が設定変更・削除・権限付与をできてしまう点を指摘している",
+          "`allowExternalShare: true` を既定にすると、外部共有リンクが本人の意図なく発行されうることに触れている",
+          "`auditLogEnabled: false` だと、事故が起きた後に何が漏れたのかを追跡できない（後から遡って有効化できない）ことに触れている",
+          "安全側を既定にし、危険な設定は明示的な操作でのみ有効化する（secure by default / opt-in）という原則を述べている",
+          "既存データにも同じ設定が入っている可能性があり、移行時の棚卸しが必要だと述べている",
+          "危険な設定を有効化する際の警告表示・権限制限・記録など、運用面の担保に言及している"
+        ]
+      },
+      {
+        "id": "sec-5",
+        "type": "free",
+        "severity": "Critical",
+        "situation": "管理画面の会員検索。名前の部分一致とステータスで絞り込む。社内利用のみで、アクセスできるのは管理者だけ。手元では検索も動き、テストも通っている。",
+        "code": "async function searchUsers({ keyword, status, sort }) {\n  const sql = `\n    SELECT id, name, email, status\n    FROM users\n    WHERE name LIKE '%${keyword}%'\n      AND status = '${status}'\n    ORDER BY ${sort}\n    LIMIT 100\n  `;\n  return db.$queryRawUnsafe(sql);\n}",
+        "prompt": "このコードの問題点を説明し、修正方針を示してください。「社内の管理者しか使わないから安全」という主張に対する反論も含めてください。",
+        "rubric": [
+          "文字列連結によりSQLインジェクションが成立することを指摘している",
+          "具体的な攻撃例（クォートを閉じて条件を追加する、UNIONで他テーブルを読む、など）に触れている",
+          "プレースホルダ（パラメータ化クエリ）またはクエリビルダ／ORMの安全なAPIを使う修正を示している",
+          "`ORDER BY` にはプレースホルダが使えないため、許可リストで列名を検証する必要があると述べている",
+          "LIKE のワイルドカード文字（% と _）のエスケープに触れている",
+          "「管理者しか使わない」への反論として、管理者アカウントの乗っ取り・内部不正・XSS経由の強制リクエスト・将来の公開などを挙げている",
+          "管理画面ほど権限が強く、被害が大きい（全会員情報に到達できる）という点を指摘している",
+          "DB接続ユーザーの権限最小化やログ・監査など、多層防御の観点に言及している"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "test",
+    "no": "04",
+    "name": "自動テスト",
+    "lead": "緑のテストが、何を保証していないのかを言えるようにする。",
+    "questions": [
+      {
+        "id": "test-1",
+        "type": "mcq",
+        "severity": "Major",
+        "situation": "割引計算のテスト。外部依存を排除するためにモックを徹底した。カバレッジは100%で、CIも緑。",
+        "code": "// 実装\nasync function calculateTotal(cart, couponCode) {\n  const coupon = await couponRepo.find(couponCode);\n  const discount = coupon ? cart.subtotal * coupon.rate : 0;\n  return cart.subtotal - discount;\n}\n\n// テスト\ntest(\"クーポンが適用される\", async () => {\n  const calc = jest.fn().mockResolvedValue(900);\n  couponRepo.find = jest.fn().mockResolvedValue({ rate: 0.1 });\n\n  const result = await calc({ subtotal: 1000 }, \"SAVE10\");\n\n  expect(calc).toHaveBeenCalledWith({ subtotal: 1000 }, \"SAVE10\");\n  expect(result).toBe(900);\n});",
+        "prompt": "このテストは何を保証しているか。",
+        "choices": [
+          "割引計算のロジックが正しいことを保証している",
+          "クーポンリポジトリとの結合が正しいことを保証している",
+          "何も保証していない。テスト対象の関数を呼ばず、モックが自分で返した値を検証しているだけである",
+          "境界値以外のケースについては保証している"
+        ],
+        "answer": 2,
+        "explanation": "テストが呼んでいる `calc` はモックであり、本物の `calculateTotal` は一度も実行されていない。`toBe(900)` が確認しているのは「モックに設定した戻り値がモックから返ってきたこと」だけ。実装の割引計算を丸ごと削除してもこのテストは緑のままになる。カバレッジ100%という数字も、この関数については嘘をついている。テスト対象は本物を呼び、モックにするのは制御しきれない外部依存（ネットワーク・時刻・乱数）に留める。テストを疑うときは「実装を壊したらこのテストは落ちるか」を問うのが早い。",
+        "principle": "モックが増えるほど、テストは実装ではなくモックの設定を検証しはじめる。実装を壊しても落ちないテストは、テストではない。"
+      },
+      {
+        "id": "test-2",
+        "type": "free",
+        "severity": "Major",
+        "situation": "「特定の条件で送料が二重に加算される」という問い合わせが来た。原因はすぐ分かり、1行の修正で直った。手元で再現手順をなぞると、確かに直っている。実装者は「修正内容が自明なのでテストは不要」と言っている。",
+        "code": "// 修正前\nfunction calcShipping(order) {\n  let fee = BASE_FEE;\n  if (order.isRemoteArea) fee += REMOTE_FEE;\n  if (order.items.some((i) => i.isOversized)) fee += OVERSIZE_FEE;\n  if (order.isRemoteArea) fee += REMOTE_FEE;   // ← 重複していた行\n  return fee;\n}\n\n// 修正後\nfunction calcShipping(order) {\n  let fee = BASE_FEE;\n  if (order.isRemoteArea) fee += REMOTE_FEE;\n  if (order.items.some((i) => i.isOversized)) fee += OVERSIZE_FEE;\n  return fee;\n}",
+        "prompt": "「修正が自明ならテストは不要」という主張に、あなたはどう答えるか。バグ修正におけるテストの書き方（何を、どの順番で書くか）も含めて説明してください。",
+        "rubric": [
+          "先に失敗する再現テストを書き、それが落ちることを確認してから修正する順序を述べている",
+          "テストが落ちることを確認しないと、そのテストが本当にバグを捉えているか分からない、という理由を示している",
+          "修正の自明さと、再発防止の必要性は別の話であると切り分けている",
+          "同じバグが将来のリファクタリングやマージで復活しうる（回帰）ことに触れている",
+          "報告された1ケースだけでなく、近接する条件（僻地×大型、僻地のみ、大型のみ、どちらでもない）も押さえる観点がある",
+          "バグが出た箇所は仕様が曖昧または複雑だった証拠であり、テストが仕様の記録として残る価値に触れている",
+          "テストの表現（期待値をベタ書きし、実装の計算式をテスト側で再現しない）に言及している",
+          "「なぜこのテストが存在するか」が分かる命名・コメント（問い合わせ番号など）に触れている"
+        ]
+      },
+      {
+        "id": "test-3",
+        "type": "free",
+        "severity": "Major",
+        "situation": "個人開発のサービスを公開しようとしている。テストは1本も無い。締め切りまでに書けるのは、多く見積もって10本程度。機能は、ユーザー登録・ログイン・商品検索・カート・決済・注文履歴・お問い合わせフォーム・管理画面の商品CRUD・メール通知・利用規約ページ、と一通りある。",
+        "prompt": "限られた10本のテストを、どの機能に、どういう基準で割り当てるか。優先順位とその理由を書いてください。",
+        "rubric": [
+          "「壊れたときの損害の大きさ × 壊れる確率」で優先順位を決める、といった明示的な基準を提示している",
+          "取り返しのつかない領域（決済・課金・認証認可・データの破壊や消失）を最優先に置いている",
+          "手動で気づきにくいもの（非同期処理、条件分岐が多い計算、権限判定）を上位に置いている",
+          "静的ページや文言のように、壊れても損害が小さく目視でも分かるものを下位に置いている",
+          "実装の詳細ではなく、ユーザーが実際に通る主要な経路（ハッピーパス）をE2Eで薄く1本通す、という発想がある",
+          "テストの粒度（E2Eを厚く積まず、重要ロジックは単体で厚く）にコストの観点から触れている",
+          "認可（他人のデータが見えないこと）を明示的にテスト対象に挙げている",
+          "10本で守れないものは何かを自覚し、監視・ログ・段階公開など別の手段で補う発想がある"
+        ]
+      },
+      {
+        "id": "test-4",
+        "type": "mcq",
+        "severity": "Major",
+        "situation": "キャンペーン期間の判定ロジックのテスト。手元では常に緑で、CIでもだいたい通る。ただし週に1〜2回、原因不明で赤くなり、再実行すると通る。",
+        "code": "test(\"キャンペーン期間中は割引が適用される\", async () => {\n  await db.campaign.create({\n    data: { code: \"SUMMER\", startsAt: new Date(), endsAt: addDays(new Date(), 7) },\n  });\n\n  const result = await applyCampaign({ subtotal: 1000 }, \"SUMMER\");\n\n  expect(result.discounted).toBe(true);\n  expect(await db.campaign.count()).toBe(1);\n});",
+        "prompt": "このテストが不安定になっている、最も本質的な原因はどれか。",
+        "choices": [
+          "`await` の付け忘れがあり、非同期処理の完了前にアサーションが走っている",
+          "実時間と共有DBに依存しており、実行時刻と他テストの残したデータによって結果が変わる",
+          "`toBe` ではなく `toEqual` を使うべきである",
+          "テストの実行時間が長く、CIのタイムアウトに掛かっている"
+        ],
+        "answer": 1,
+        "explanation": "壊れやすさの原因は2つ重なっている。ひとつは実時間依存で、`new Date()` を境界に使っているため、日付が変わる瞬間やタイムゾーン、夏時間の切り替えで判定がずれる。もうひとつは共有状態依存で、`count()` が1であることは「このテストが走る時にcampaignテーブルが空である」ことを前提にしており、並列実行や前のテストの残骸で簡単に崩れる。時刻は注入可能にして固定し（フェイククロック）、データは各テストが自分で用意して片付けるか、テストごとに独立させる。再実行で通ったから問題なし、として放置すると、本物の不具合が出た時にも「またフレーキーだろう」と無視されるようになる。",
+        "principle": "テストは時刻・順序・共有状態に依存した瞬間、確率的になる。再実行で緑になるテストは、直すか消すかの二択で扱う。"
+      },
+      {
+        "id": "test-5",
+        "type": "mcq",
+        "severity": "Major",
+        "situation": "「購入金額が5,000円以上で送料無料」という仕様の実装とテスト。レビューでもロジックは正しいと確認され、CIも緑。",
+        "code": "// 実装\nfunction shippingFee(subtotal) {\n  return subtotal > 5000 ? 0 : 500;\n}\n\n// テスト\ntest(\"送料無料の判定\", () => {\n  expect(shippingFee(3000)).toBe(500);\n  expect(shippingFee(10000)).toBe(0);\n});",
+        "prompt": "このテストが見逃している最も重要なケースはどれか。",
+        "choices": [
+          "`subtotal` が負の数のケース",
+          "ちょうど5,000円のケース。仕様は「5,000円以上」だが実装は `>` なので、境界の1点だけ仕様と食い違う",
+          "`subtotal` が文字列で渡されたケース",
+          "`subtotal` が極端に大きい場合の桁あふれ"
+        ],
+        "answer": 1,
+        "explanation": "3,000円と10,000円は、境界から遠く離れた「どちらに転んでも同じ結果になる」値であり、`>` と `>=` の違いを検出できない。ちょうど5,000円のとき、仕様では送料無料、実装では500円になる。この1点だけがずれ、しかもキャンペーンで一番注文が集まる金額でもある。境界値は「境界そのもの・その直前・その直後」の3点を押さえる（4999 / 5000 / 5001）。0円、null、負数のような異常系も別途必要だが、まず仕様の分岐点そのものを外さない。",
+        "principle": "バグは値の真ん中ではなく境界に住む。仕様に「以上・以下・未満・より大きい」が出てきたら、その一点を必ずテストで固定する。"
+      }
+    ]
+  },
+  {
+    "id": "release",
+    "no": "05",
+    "name": "公開前セルフレビュー",
+    "lead": "出す直前の自分に、他人の目で問いを立てる。",
+    "questions": [
+      {
+        "id": "rel-1",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "APIの共通エラーハンドラ。障害調査を早くしたいので、レスポンスに詳細を載せている。異常系のテストも通っており、フロントのエラー表示も分かりやすくなった。",
+        "code": "app.use((err, req, res, next) => {\n  console.error(err);\n  res.status(500).json({\n    error: err.message,\n    stack: err.stack,\n    query: err.query,\n    env: process.env,\n  });\n});",
+        "prompt": "本番公開前に、まず何を直すべきか。",
+        "choices": [
+          "`console.error` ではなく構造化ロガーを使うべきである",
+          "レスポンスに例外の詳細と環境変数が含まれており、APIキーや接続情報、内部構造が攻撃者にそのまま渡る",
+          "ステータスコードを常に500にしているのが誤りである",
+          "`next` を呼んでいないので、後続のミドルウェアが動かない"
+        ],
+        "answer": 1,
+        "explanation": "`process.env` にはDBの接続文字列、APIキー、署名用シークレットが入っている。それをHTTPレスポンスに載せるのは、鍵束を封筒に入れて配るのと同じ。`err.stack` と `err.query` も、ファイル構成・使用ライブラリ・テーブル名・クエリ構造を教え、攻撃の下調べを不要にする。エラーを意図的に発生させれば誰でも取り出せる。クライアントには一般的なメッセージと追跡用のIDだけを返し、詳細はサーバー側のログに紐づけて記録する。選択肢1・3・4も改善点だが、機密が漏れる問題とは重さが違う。",
+        "principle": "調査に必要な情報はサーバーのログへ、クライアントには追跡IDだけを返す。デバッグのしやすさと引き換えに機密を外へ出さない。"
+      },
+      {
+        "id": "rel-2",
+        "type": "free",
+        "severity": "Major",
+        "situation": "明日リリース予定。セルフレビューで7つの気になる点が見つかったが、全部直す時間は無い。\n\n1. 管理者の権限チェックが1エンドポイントだけ抜けている\n2. 一覧APIにページネーションが無い（現在のデータは200件）\n3. パスワード再設定メールのリンクに有効期限が無い\n4. フォームのバリデーションメッセージが英語のまま\n5. 画像アップロードにファイルサイズの上限が無い\n6. ログにユーザーのメールアドレスが平文で出ている\n7. 404ページのデザインが仮のまま",
+        "prompt": "この7つをどう捌くか。「リリース前に必ず直す」「リリースするが即座に対応する」「後回しでよい」に振り分け、その判断基準を説明してください。",
+        "rubric": [
+          "「取り返しがつくか（事後に回復できるか）」を主要な判断軸として明示している",
+          "権限チェックの漏れ（1）を最優先で修正対象にしている",
+          "有効期限の無い再設定リンク（3）を、アカウント乗っ取りに直結する重大な欠陥として扱っている",
+          "サイズ上限の無いアップロード（5）を、ストレージ枯渇やサービス停止のリスクとして評価している",
+          "ログへの個人情報出力（6）を、消し込みが困難で法令上の問題にもなりうる点から評価している",
+          "ページネーション（2）を、現在のデータ量と増加速度から相対的に低い優先度と判断できている",
+          "文言（4）や404デザイン（7）を、事後修正が容易で損害が小さいものとして後回しにしている",
+          "後回しにする項目について、放置ではなく記録・期限・監視といった手当てを述べている",
+          "「全部直せないならリリースしない」でも「動くから全部出す」でもない、リスクに基づく判断を示している"
+        ]
+      },
+      {
+        "id": "rel-3",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "ユーザーテーブルの `full_name` を `display_name` に改名する。マイグレーションはローカルで正常に完了し、アプリのコードも一括置換済み。テストも全部通る。デプロイは無停止のローリングアップデートで、複数のインスタンスが順次入れ替わる。",
+        "code": "-- migration: 2025_08_18_rename_full_name.sql\nALTER TABLE users RENAME COLUMN full_name TO display_name;",
+        "prompt": "この手順を本番でそのまま実行すると、何が起きるか。",
+        "choices": [
+          "`ALTER TABLE` がテーブル全体をロックし、実行中の数分間だけ書き込みが止まる",
+          "デプロイの途中は新旧のコードが同時に動いているため、旧コードが参照する `full_name` が消え、切り替わりきるまでエラーが出続ける",
+          "改名によってインデックスが失われ、検索が遅くなる",
+          "マイグレーション履歴に記録されないため、次回のデプロイで再実行される"
+        ],
+        "answer": 1,
+        "explanation": "ローリングアップデートでは、新旧のアプリケーションが数分から数十分にわたって同居する。列を改名した瞬間、まだ入れ替わっていない旧インスタンスのクエリは全て「列が存在しない」で落ちる。ロールバックしようにも、新コードは `display_name` を前提にしているので、どちらに転んでも壊れる。破壊的なスキーマ変更は expand / migrate / contract の3段階に分ける。まず新しい列を追加して両方に書く（expand）、次にデータを移して読み取りを新列に切り替える（migrate）、全インスタンスが新コードになったのを確認してから旧列を落とす（contract）。各段階が単独でデプロイ可能で、いつでも前に戻せるのが要点。",
+        "principle": "無停止デプロイでは新旧のコードが必ず同居する。スキーマ変更は「1つ前のバージョンのコードでも動くか」を満たす形に分割する。"
+      },
+      {
+        "id": "rel-4",
+        "type": "mcq",
+        "severity": "Critical",
+        "situation": "モバイルアプリと管理画面から同じAPIを叩く。開発中にCORSで詰まったので設定を緩めたところ動くようになり、そのままリリース間近まで来た。認証はCookieベース。",
+        "code": "app.use(\n  cors({\n    origin: (requestOrigin, callback) => callback(null, true),\n    credentials: true,\n    methods: [\"GET\", \"POST\", \"PUT\", \"PATCH\", \"DELETE\"],\n    allowedHeaders: [\"Content-Type\", \"Authorization\", \"X-CSRF-Token\"],\n  })\n);",
+        "prompt": "この設定を本番に出すと何が起きるか。",
+        "choices": [
+          "すべてのオリジンが許可されるため、任意の悪意あるサイトがログイン中のユーザーのCookieを伴ってAPIを呼び、レスポンスを読み取れる",
+          "プリフライトリクエストが増えてレイテンシが悪化する",
+          "`allowedHeaders` に `X-CSRF-Token` があるため、CSRF対策が無効化される",
+          "`credentials: true` はCookieを送らない設定なので、認証が通らなくなる"
+        ],
+        "answer": 0,
+        "explanation": "`origin` のコールバックがリクエスト元をそのまま反射して許可しているため、実質的に全オリジン許可でありながら `credentials: true` が有効になっている（`origin: \"*\"` と `credentials: true` の組み合わせはブラウザが拒否するが、この書き方は素通りする）。結果、攻撃者のサイトに誘導されたログイン中のユーザーのブラウザから、Cookie付きでAPIが呼ばれ、しかもレスポンスの中身をスクリプトが読める。同一オリジンポリシーが本来防いでいた情報の読み取りが丸ごと無効になる。許可するオリジンは環境変数で明示した許可リストと照合し、一致しないものは拒否する。",
+        "principle": "CORSは「誰にレスポンスを読ませてよいか」の宣言である。開発の詰まりを解くために広げた設定は、公開前に必ず許可リストへ畳み直す。"
+      },
+      {
+        "id": "rel-5",
+        "type": "free",
+        "severity": "Critical",
+        "situation": "個人開発のサービスを初めて本番公開する。デプロイ手順は下のスクリプト1枚にまとめてある。ローカルとステージングでは、このスクリプトで問題なくデプロイできている。",
+        "code": "#!/bin/bash\n# deploy.sh\nset -e\n\ngit pull origin main\nnpm install\nnpm run build\n\n# 環境変数はリポジトリの .env をそのまま使う\ncp .env.production .env\n\nnpm run migrate\n\npm2 restart app\n\necho \"deployed!\"",
+        "prompt": "このデプロイ手順を公開前に見直す。危険な点と、足りていない点を挙げてください。あなたが公開前に必ず確認するチェック項目も列挙してください。",
+        "rubric": [
+          "本番の秘密情報をリポジトリ内の .env で管理している点を、漏洩経路として指摘している",
+          "秘密情報を環境変数やシークレット管理サービスへ移し、リポジトリから削除する（履歴からの除去と鍵のローテーションを含む）ことに触れている",
+          "マイグレーションの失敗時に切り戻す手段が無い点を指摘している（バックアップ取得や事前検証）",
+          "デプロイ前のデータベースバックアップを必須の手順として挙げている",
+          "`git pull` でその時点のmainを取る（何を出したのかが特定できない）ことの問題に触れ、タグやコミットハッシュでの固定を提案している",
+          "テスト・Lint・型チェックがデプロイ経路に組み込まれていない点を指摘している",
+          "再起動時のダウンタイムやヘルスチェックの不在に触れている",
+          "公開前チェック項目として、認証・認可の確認、エラー情報の露出、ログとアラートの設定、バックアップの復元テスト、HTTPS／セキュリティヘッダ、レート制限、依存の脆弱性確認などを具体的に列挙している",
+          "「動いた」ことと「安全に運用できる」ことを分けて考えられている"
+        ]
+      }
+    ]
+  }
+]

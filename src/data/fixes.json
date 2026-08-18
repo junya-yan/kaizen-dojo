@@ -1,0 +1,268 @@
+{
+  "rev-1": {
+    "lang": "js",
+    "code": "// GET /admin/orders\nasync function listOrders(req, res) {\n  const limit = Math.min(Number(req.query.limit ?? 50), 100);\n  const cursor = req.query.cursor ? { id: Number(req.query.cursor) } : undefined;\n\n  // 1) 注文はページ単位で取る（件数の上限を設計で決める）\n  const orders = await db.order.findMany({\n    where: { status: \"paid\" },\n    orderBy: [{ createdAt: \"desc\" }, { id: \"desc\" }],\n    take: limit,\n    skip: cursor ? 1 : 0,\n    cursor,\n  });\n\n  if (orders.length === 0) {\n    return res.json({ rows: [], nextCursor: null });\n  }\n\n  // 2) 関連は「まとめて1回」取り、メモリ上で突き合わせる\n  const orderIds = orders.map((o) => o.id);\n  const customerIds = [...new Set(orders.map((o) => o.customerId))];\n\n  const [customers, itemCounts] = await Promise.all([\n    db.customer.findMany({\n      where: { id: { in: customerIds } },\n      select: { id: true, name: true },\n    }),\n    db.orderItem.groupBy({\n      by: [\"orderId\"],\n      where: { orderId: { in: orderIds } },\n      _count: { _all: true },\n    }),\n  ]);\n\n  const customerById = new Map(customers.map((c) => [c.id, c]));\n  const countByOrderId = new Map(itemCounts.map((c) => [c.orderId, c._count._all]));\n\n  const rows = orders.map((order) => ({\n    id: order.id,\n    customerName: customerById.get(order.customerId)?.name ?? \"(削除済み)\",\n    itemCount: countByOrderId.get(order.id) ?? 0,\n    total: order.total,\n  }));\n\n  res.json({ rows, nextCursor: orders.at(-1).id });\n}",
+    "notes": [
+      "ループ内のクエリを廃止し、関連データは `in` 句でまとめて1回ずつ取得する。クエリ数が 2N+1 回から3回に固定される。",
+      "明細は全件取得せず `groupBy` で件数だけ数える。表示に使わないデータをアプリまで運ばない。",
+      "カーソル方式のページネーションを入れ、件数の上限を設計時に決める。上限の無い一覧APIは、データが増えた時点で必ず障害になる。",
+      "顧客と明細は互いに独立なので `Promise.all` で並列化する。",
+      "並び順の同値をIDで解いて（`createdAt` + `id`）、ページ送りで行が重複・欠落しないようにする。",
+      "顧客が見つからない場合に落ちないよう、参照結果の欠損を明示的に扱う。"
+    ]
+  },
+  "rev-2": {
+    "lang": "js",
+    "code": "class ReceiptMailError extends Error {\n  constructor(cause) {\n    super(\"領収書メールの送信に失敗しました\");\n    this.name = \"ReceiptMailError\";\n    this.cause = cause;\n  }\n}\n\nasync function completePayment(orderId) {\n  const order = await db.order.update({\n    where: { id: orderId },\n    data: { status: \"paid\", paidAt: new Date() },\n  });\n\n  // 決済の成否とメール送信の成否を切り離す。\n  // 送信はジョブとして永続化し、失敗しても後から再実行できるようにする。\n  try {\n    await mailQueue.enqueue({\n      type: \"receipt\",\n      orderId: order.id,\n      to: order.customerEmail,\n      // 同じ注文で二重送信しないための冪等キー\n      idempotencyKey: `receipt:${order.id}`,\n    });\n  } catch (cause) {\n    // 「決済は止めない」という要件は守る。ただし黙って捨てない。\n    logger.error({\n      event: \"receipt_mail_enqueue_failed\",\n      orderId: order.id,\n      err: new ReceiptMailError(cause),\n    });\n    metrics.increment(\"receipt_mail.enqueue_failed\");\n    // 送信されていない事実をデータとして残し、再送バッチと管理画面から追える状態にする\n    await db.order\n      .update({ where: { id: order.id }, data: { receiptMailStatus: \"failed\" } })\n      .catch(() => {});\n  }\n\n  return order;\n}",
+    "notes": [
+      "空の `catch` をやめ、ログ・メトリクス・データの3箇所に失敗の痕跡を残す。観測できない失敗は、存在しないのと同じ扱いになる。",
+      "送信そのものをキューへの投入に変え、リトライとバックオフをキュー側の責務にする。一時的なSMTP障害で領収書が永久に失われない。",
+      "冪等キーを付けて、リトライしても同じ注文の領収書が二重に届かないようにする。",
+      "`receiptMailStatus` を注文に持たせ、未送信の注文を後から一覧・再送できるようにする。問い合わせが来る前にこちらから気づける。",
+      "失敗件数をメトリクス化し、閾値でアラートを上げられるようにする。",
+      "「決済は止めない」という元の要件は変えていない。変えたのは、失敗が誰にも見えないという点だけ。"
+    ]
+  },
+  "rev-3": {
+    "lang": "js",
+    "code": "async function reserveSeat(eventId, userId) {\n  return db.$transaction(async (tx) => {\n    // 条件つきの原子的な更新。判断の根拠（残席 > 0）と減算を1つの文にまとめる。\n    // 同時に来た2つのリクエストは、DBが直列化するので必ず片方だけが成功する。\n    const updated = await tx.$executeRaw`\n      UPDATE events\n         SET remaining_seats = remaining_seats - 1\n       WHERE id = ${eventId}\n         AND remaining_seats > 0\n    `;\n\n    if (updated === 0) {\n      throw new SoldOutError(eventId);\n    }\n\n    // 同一トランザクション内で予約を作る。\n    // 予約の作成に失敗すれば残席の減算ごとロールバックされる。\n    try {\n      return await tx.reservation.create({ data: { eventId, userId } });\n    } catch (e) {\n      // (event_id, user_id) の UNIQUE 制約違反 = 二重予約\n      if (isUniqueViolation(e)) {\n        throw new AlreadyReservedError(eventId, userId);\n      }\n      throw e;\n    }\n  });\n}\n\n// スキーマ側にも不変条件を持たせる（アプリを通らない経路でも守られる）\n//   ALTER TABLE events\n//     ADD CONSTRAINT remaining_seats_non_negative CHECK (remaining_seats >= 0);\n//   CREATE UNIQUE INDEX reservations_event_user_uniq\n//     ON reservations (event_id, user_id);",
+    "notes": [
+      "残席の確認と減算を、`WHERE remaining_seats > 0` を含む1つのUPDATEに統合する。読み取りと書き込みの間に他のリクエストが割り込む隙間を無くす。",
+      "更新行数が0であることを「売り切れ」の判定に使う。アプリ側で読んだ値を信じない。",
+      "残席の減算と予約の作成を同一トランザクションに入れ、片方だけが残る状態を防ぐ。",
+      "`CHECK (remaining_seats >= 0)` をDBに置き、バッチや管理画面など別経路からの操作でも定員超過を許さない。",
+      "(event_id, user_id) にUNIQUE制約を張り、二重送信による重複予約を制約違反として捕捉する。",
+      "エラーを型で区別し（売り切れ／予約済み）、呼び出し側が適切なメッセージを出せるようにする。"
+    ]
+  },
+  "rev-4": {
+    "lang": "bash",
+    "code": "# このPRに残すのは、説明文が述べている変更だけ。\n--- a/src/components/Footer.tsx\n+++ b/src/components/Footer.tsx\n-      <small>© 2024 Kaizen Inc.</small>\n+      <small>© 2025 Kaizen Inc.</small>\n\n# 決済まわりの変更は別ブランチへ切り出す\ngit switch -c chore/payment-retry-tuning main\ngit restore --source=HEAD~1 --staged --worktree src/lib/payment.ts\n\n# 別PRの説明に、最低限これだけは書いてもらう:\n#   - なぜ変えるのか（どの障害・どの計測に基づくのか）\n#   - リトライ 3→10 / バックオフ 1000ms→100ms が決済プロバイダに与える負荷の見積もり\n#   - タイムアウト 30s→5s で「アプリは失敗・決済は成立」が起きた場合の扱い\n#   - 監視項目（決済成功率、二重課金の検知）と切り戻し手順",
+    "notes": [
+      "PRの説明と差分の中身を一致させる。レビュアーが何を見ればよいか分かる状態が、レビューの前提条件になる。",
+      "決済の設定変更は独立したPRに切り出し、決済の責任者を巻き込んだレビューを受けられるようにする。",
+      "リトライ回数とバックオフの変更は外部サービスへの負荷を10倍以上にしうるため、根拠となる計測を要求する。",
+      "タイムアウト短縮は「アプリ上は失敗、決済は成立」という不整合を生む。二重課金の検知手段まで設計に含める。",
+      "切り戻し手順を先に決めておく。設定値の変更は、コードの変更よりも「戻せること」が効く。"
+    ]
+  },
+  "db-1": {
+    "lang": "sql",
+    "code": "-- 金額は最小単位（円）の整数、または NUMERIC で保持する。\n-- 複数通貨を扱う可能性があるなら通貨コードも同時に持たせる。\nCREATE TABLE orders (\n  id            BIGSERIAL PRIMARY KEY,\n  user_id       BIGINT NOT NULL REFERENCES users(id),\n  currency      CHAR(3) NOT NULL DEFAULT 'JPY',\n  subtotal      NUMERIC(14,4) NOT NULL CHECK (subtotal >= 0),\n  tax           NUMERIC(14,4) NOT NULL CHECK (tax >= 0),\n  total         NUMERIC(14,4) NOT NULL CHECK (total >= 0),\n  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),\n\n  -- 合計の整合性をDB側の不変条件として持つ\n  CONSTRAINT orders_total_matches CHECK (total = subtotal + tax)\n);\n\nCREATE INDEX orders_user_id_created_at_idx ON orders (user_id, created_at DESC);\n\n-- 集計は誤差なく積み上がる\nSELECT user_id, currency, SUM(total) AS lifetime_value\nFROM orders\nGROUP BY user_id, currency;\n\n-- 既存データの移行（誤差の入った値をそのまま移さない）\n-- ALTER TABLE orders ADD COLUMN total_new NUMERIC(14,4);\n-- UPDATE orders SET total_new = ROUND(total::numeric, 4);\n-- （検算後に旧列を削除する。詳細は破壊的マイグレーションの設問を参照）",
+    "notes": [
+      "`DOUBLE PRECISION` を `NUMERIC(14,4)` に変更する。10進数を正確に表現でき、`SUM` を重ねても誤差が積み上がらない。",
+      "小数部を4桁確保し、税率計算の中間値を丸めずに保持できるようにする（表示時に通貨ごとの丸めを適用する）。",
+      "`currency` を持たせる。金額だけの列は、通貨が増えた瞬間に意味を失う。",
+      "`CHECK (total = subtotal + tax)` で合計の整合性をDB側の不変条件にする。アプリのバグでずれた値が入らない。",
+      "負の金額を `CHECK` で弾き、異常なデータが集計に混ざるのを防ぐ。",
+      "既存データの移行は新列追加→検算→旧列削除の順で行う。型変更だけを先に走らせない。"
+    ]
+  },
+  "db-2": {
+    "lang": "sql",
+    "code": "-- タグはマスタ + 中間テーブルに正規化する\nCREATE TABLE tags (\n  id    BIGSERIAL PRIMARY KEY,\n  name  TEXT NOT NULL,\n  slug  TEXT NOT NULL,\n  CONSTRAINT tags_slug_uniq UNIQUE (slug)\n);\n\nCREATE TABLE article_tags (\n  article_id  BIGINT NOT NULL REFERENCES articles(id) ON DELETE CASCADE,\n  tag_id      BIGINT NOT NULL REFERENCES tags(id)     ON DELETE RESTRICT,\n  PRIMARY KEY (article_id, tag_id)\n);\n\n-- タグ側からの検索を効かせる\nCREATE INDEX article_tags_tag_id_idx ON article_tags (tag_id);\n\n-- タグ検索（完全一致・インデックスが効く）\nSELECT a.*\nFROM articles a\nJOIN article_tags at ON at.article_id = a.id\nJOIN tags t          ON t.id = at.tag_id\nWHERE t.slug = 'react';\n\n-- タグ別の記事数\nSELECT t.slug, COUNT(*) AS article_count\nFROM tags t\nJOIN article_tags at ON at.tag_id = t.id\nGROUP BY t.slug\nORDER BY article_count DESC;\n\n-- タグ名の変更は1行のUPDATEで済む\nUPDATE tags SET name = 'Testing', slug = 'testing' WHERE slug = 'test';",
+    "notes": [
+      "カンマ区切りをやめ、`tags` マスタと `article_tags` 中間テーブルに分ける。1つの列に複数の値を詰めるのをやめた時点で、制約と索引が使えるようになる。",
+      "`slug` に UNIQUE を張り、表記ゆれによる同義タグの乱立を防ぐ。",
+      "複合主キー (article_id, tag_id) により、同じタグを同じ記事に二重付与できなくなる。",
+      "外部キーで存在しないタグを参照できなくする。`ON DELETE CASCADE` で記事削除時の紐付けを自動で片付ける。",
+      "`LIKE '%react%'` の部分一致をやめ、完全一致 + インデックスにする。'preact' や 'react-native' の誤ヒットが構造的に起きなくなる。",
+      "タグ別集計とタグ名の変更が、それぞれ1クエリ・1行のUPDATEで済むようになる。"
+    ]
+  },
+  "db-3": {
+    "lang": "sql",
+    "code": "-- 1) 既存の重複を洗い出す（制約を張る前に必ず調べる）\nSELECT lower(btrim(email)) AS normalized, COUNT(*), array_agg(id ORDER BY id)\nFROM users\nGROUP BY 1\nHAVING COUNT(*) > 1;\n\n-- 2) 一意性の判定基準を正規化して固定する\nUPDATE users SET email = lower(btrim(email));\n\n-- 3) DBを最後の砦にする\nALTER TABLE users\n  ADD CONSTRAINT users_email_uniq UNIQUE (email);\n\n-- 大文字小文字を区別せずに一意としたい場合は関数インデックスでもよい\n-- CREATE UNIQUE INDEX users_email_lower_uniq ON users (lower(email));\n\n-- 本番では排他ロックを避けるため CONCURRENTLY で作ってから制約に昇格させる\n-- CREATE UNIQUE INDEX CONCURRENTLY users_email_uniq ON users (email);\n-- ALTER TABLE users ADD CONSTRAINT users_email_uniq UNIQUE USING INDEX users_email_uniq;\n\n-- 4) アプリ側は事前チェックを残しつつ、制約違反を同じエラーに変換する\n--\n-- async function register({ email, name }) {\n--   const normalized = email.trim().toLowerCase();\n--   try {\n--     return await db.user.create({ data: { email: normalized, name } });\n--   } catch (e) {\n--     if (isUniqueViolation(e, \"users_email_uniq\")) {\n--       throw new EmailTakenError(normalized);\n--     }\n--     throw e;\n--   }\n-- }",
+    "notes": [
+      "アプリ側の事前チェックは競合状態に無力なので、UNIQUE 制約をDBに置く。確認と挿入の間に割り込まれても重複行が作られない。",
+      "制約はアプリを通らない経路（バッチ、データ移行、管理画面、手動SQL）にも効く。守り方をアプリだけに置かない。",
+      "制約を張る前に既存の重複を調査する。重複が残っているとマイグレーションが失敗する。",
+      "大文字小文字と前後の空白を正規化し、一意性の判定基準を明示する。`User@example.com` と `user@example.com` を別人にしない。",
+      "本番のテーブルには `CREATE UNIQUE INDEX CONCURRENTLY` を使い、長時間の書き込みロックを避ける。",
+      "アプリ側は事前チェックを残す（UX のため）が、最終判定はDBの制約違反を捕捉して行う。"
+    ]
+  },
+  "db-4": {
+    "lang": "sql",
+    "code": "-- 注文明細は「購入時点の事実」を自分で保持する\nCREATE TABLE order_items (\n  id            BIGSERIAL PRIMARY KEY,\n  order_id      BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,\n\n  -- 商品への参照は「どの商品だったか」を辿るためだけに残す（表示には使わない）\n  product_id    BIGINT REFERENCES products(id) ON DELETE SET NULL,\n\n  -- 購入時点のスナップショット\n  product_name  TEXT NOT NULL,\n  unit_price    NUMERIC(14,4) NOT NULL CHECK (unit_price >= 0),\n  tax_rate      NUMERIC(5,4) NOT NULL CHECK (tax_rate >= 0),\n  quantity      INT NOT NULL CHECK (quantity > 0),\n\n  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()\n);\n\nCREATE INDEX order_items_order_id_idx ON order_items (order_id);\n\n-- 注文履歴の表示（products への JOIN が不要になる）\nSELECT product_name,\n       unit_price,\n       quantity,\n       unit_price * quantity AS line_total\nFROM order_items\nWHERE order_id = $1\nORDER BY id;",
+    "notes": [
+      "商品名・単価・税率を購入時点でコピーして保存する。マスタの値上げや改名が過去の注文履歴を書き換えなくなる。",
+      "この非正規化は冗長ではなく「履歴は不変である」という要件そのもの。正規化の原則より要件が優先する典型例。",
+      "`product_id` は残すが `ON DELETE SET NULL` にする。商品が削除されても履歴は読める。",
+      "税率も保存する。税率改定後に過去の注文を再計算すると、発行済みの領収書と金額が食い違う。",
+      "`quantity > 0` などの CHECK 制約で、異常なデータが集計に混ざるのを防ぐ。",
+      "表示クエリから JOIN が消え、明細の取得が注文IDのインデックス1本で完結する。"
+    ]
+  },
+  "db-5": {
+    "lang": "sql",
+    "code": "CREATE TABLE users (\n  id          BIGSERIAL PRIMARY KEY,\n  name        TEXT NOT NULL,\n  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n);\n\nCREATE TABLE courses (\n  id          BIGSERIAL PRIMARY KEY,\n  title       TEXT NOT NULL,\n  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n);\n\n-- 多対多の関係そのものを1つのテーブルとして表す。\n-- 「受講」という事実には、開始日や進捗といった固有の属性がある。\nCREATE TABLE enrollments (\n  user_id       BIGINT NOT NULL REFERENCES users(id)   ON DELETE CASCADE,\n  course_id     BIGINT NOT NULL REFERENCES courses(id) ON DELETE RESTRICT,\n\n  status        TEXT NOT NULL DEFAULT 'active'\n                CHECK (status IN ('active', 'completed', 'withdrawn')),\n  progress      NUMERIC(5,2) NOT NULL DEFAULT 0\n                CHECK (progress BETWEEN 0 AND 100),\n  enrolled_at   TIMESTAMPTZ NOT NULL DEFAULT now(),\n  completed_at  TIMESTAMPTZ,\n\n  PRIMARY KEY (user_id, course_id),\n\n  -- 完了しているのに完了日時が無い、という状態を作らせない\n  CONSTRAINT enrollments_completed_at_consistent\n    CHECK ((status = 'completed') = (completed_at IS NOT NULL))\n);\n\n-- 「この講座の受講者一覧」を引くための索引（主キーは user_id 始まりのため別途必要）\nCREATE INDEX enrollments_course_id_idx ON enrollments (course_id);\n\n-- 受講者数は保持せず、必要なときに数える\nSELECT c.id, c.title, COUNT(e.user_id) AS student_count\nFROM courses c\nLEFT JOIN enrollments e ON e.course_id = c.id AND e.status <> 'withdrawn'\nGROUP BY c.id, c.title;",
+    "notes": [
+      "カンマ区切りのIDをやめ、`enrollments` 中間テーブルにする。外部キーが張れるようになり、存在しない講座を参照できなくなる。",
+      "複合主キー (user_id, course_id) で同一講座への二重登録を構造的に防ぐ。",
+      "受講開始日・進捗・状態を中間テーブルの列として持つ。関係そのものが属性を持てるのが中間テーブルの本質的な利点。",
+      "`ON DELETE` の方針を両側で明示する。ユーザー削除では受講記録も消す（CASCADE）が、受講者のいる講座は削除させない（RESTRICT）。",
+      "主キーが user_id 始まりのため、講座側から引く検索用に `course_id` の索引を別途張る。",
+      "`student_count` の保持をやめ、COUNT で導出する。二重管理された数値は必ずいつかずれる。",
+      "`CHECK` で状態と完了日時の整合を取り、矛盾した行がそもそも入らないようにする。"
+    ]
+  },
+  "sec-1": {
+    "lang": "js",
+    "code": "import argon2 from \"argon2\";\n\n// パスワードハッシュは「遅い・ソルトつき・コストを上げられる」専用アルゴリズムを使う。\n// argon2 はソルトを内部で生成し、ハッシュ文字列にパラメータごと埋め込む。\nconst HASH_OPTIONS = {\n  type: argon2.argon2id,\n  memoryCost: 19456, // 19 MiB（OWASP の推奨値のひとつ）\n  timeCost: 2,\n  parallelism: 1,\n};\n\nexport function hashPassword(password) {\n  return argon2.hash(password, HASH_OPTIONS);\n}\n\nexport async function login(email, password) {\n  const user = await db.user.findUnique({ where: { email } });\n\n  if (!user) {\n    // ユーザーが存在しない場合もハッシュ検証と同等の時間を消費し、\n    // 応答時間からアカウントの存在有無が漏れないようにする\n    await argon2.hash(password, HASH_OPTIONS);\n    return null;\n  }\n\n  // argon2.verify は定数時間比較を行う\n  const ok = await argon2.verify(user.passwordHash, password);\n  if (!ok) return null;\n\n  // パラメータを引き上げた場合、ログイン成功時に静かに再ハッシュして移行する\n  if (argon2.needsRehash(user.passwordHash, HASH_OPTIONS)) {\n    await db.user.update({\n      where: { id: user.id },\n      data: { passwordHash: await hashPassword(password) },\n    });\n  }\n\n  return user;\n}",
+    "notes": [
+      "SHA-256 を Argon2id に置き換える。汎用ハッシュの速さは、そのまま総当たり攻撃の速さになる。",
+      "ソルトはユーザーごとに自動生成される。同じパスワードでもハッシュが異なるため、1回の解析で全員ぶんが割れることがなくなる。",
+      "メモリコスト・時間コストをパラメータ化し、ハードウェアの進歩に合わせて後から引き上げられるようにする。",
+      "`needsRehash` でログイン成功時に静かに再ハッシュし、パラメータ変更を全ユーザーへ段階的に反映する。",
+      "`!==` による比較をやめ、定数時間比較を行う `verify` を使う。ハッシュ値の一致判定でタイミング差を出さない。",
+      "ユーザーが存在しない場合もダミーのハッシュ計算を挟み、応答時間からメールアドレスの登録有無を推測されないようにする。"
+    ]
+  },
+  "sec-2": {
+    "lang": "js",
+    "code": "// GET /api/invoices/:id\nrouter.get(\"/api/invoices/:id\", requireLogin, async (req, res) => {\n  const id = Number(req.params.id);\n  if (!Number.isInteger(id) || id <= 0) {\n    return res.status(400).json({ error: \"invalid id\" });\n  }\n\n  // 所有者条件を「取得したあとの判定」ではなく「問い合わせそのもの」に含める。\n  // 条件を書き忘れれば0件になるだけで、他人のデータが返ることはない。\n  const invoice = await db.invoice.findFirst({\n    where: {\n      id,\n      OR: [\n        { ownerId: req.user.id },\n        { organization: { members: { some: { userId: req.user.id, role: { in: [\"admin\", \"billing\"] } } } } },\n      ],\n    },\n  });\n\n  // 「存在しない」と「権限が無い」を区別せず、どちらも404を返す。\n  // 権限の無いIDを試しても、請求書の存在有無が分からない。\n  if (!invoice) {\n    logger.warn({ event: \"invoice_access_denied\", userId: req.user.id, invoiceId: id });\n    return res.status(404).json({ error: \"not found\" });\n  }\n\n  res.set(\"Cache-Control\", \"private, no-store\");\n  res.json(invoice);\n});",
+    "notes": [
+      "所有者条件をクエリの `where` に埋め込む。取得後に `if` で弾く形だと、条件を書き忘れた時に他人のデータが返る。",
+      "組織メンバーの参照も同じクエリ内で表現し、認可のルールを1箇所に集約する。",
+      "存在しない場合と権限が無い場合の両方で404を返し、レスポンスの差から請求書の存在を推測できないようにする。",
+      "拒否をログに残す。IDを総当たりされている兆候を検知できる。",
+      "IDの形式を先に検証し、想定外の値がそのままクエリに渡らないようにする。",
+      "`Cache-Control: private, no-store` を付け、共有端末やプロキシに請求書が残らないようにする。"
+    ]
+  },
+  "sec-3": {
+    "lang": "js",
+    "code": "// --- サーバー側: トークンは HttpOnly Cookie で発行する ---\napp.post(\"/api/login\", async (req, res) => {\n  const user = await authenticate(req.body.email, req.body.password);\n  if (!user) return res.status(401).json({ error: \"invalid credentials\" });\n\n  const accessToken = signAccessToken(user, { expiresIn: \"15m\" });\n  const refreshToken = await issueRefreshToken(user); // DBに保存し、失効させられるようにする\n\n  const secure = process.env.NODE_ENV === \"production\";\n\n  res.cookie(\"access_token\", accessToken, {\n    httpOnly: true,   // JavaScript から読めない\n    secure,           // HTTPS 以外では送らない\n    sameSite: \"lax\",  // 他サイトからの遷移では送られない\n    path: \"/\",\n    maxAge: 15 * 60 * 1000,\n  });\n  res.cookie(\"refresh_token\", refreshToken, {\n    httpOnly: true,\n    secure,\n    sameSite: \"strict\",\n    path: \"/api/auth/refresh\", // リフレッシュ用の経路にだけ送る\n    maxAge: 14 * 24 * 60 * 60 * 1000,\n  });\n\n  res.json({ user: { id: user.id, name: user.name } });\n});\n\n// --- クライアント側: トークンに一切触れない ---\nasync function login(email, password) {\n  const res = await fetch(\"/api/login\", {\n    method: \"POST\",\n    credentials: \"same-origin\", // Cookie はブラウザが自動で運ぶ\n    headers: { \"Content-Type\": \"application/json\" },\n    body: JSON.stringify({ email, password }),\n  });\n  if (!res.ok) throw new Error(\"LOGIN_FAILED\");\n  return res.json();\n}\n\n// SameSite だけに頼らず、状態を変える操作には CSRF トークンを併用する\nasync function post(url, body) {\n  return fetch(url, {\n    method: \"POST\",\n    credentials: \"same-origin\",\n    headers: {\n      \"Content-Type\": \"application/json\",\n      \"X-CSRF-Token\": getCsrfTokenFromMeta(),\n    },\n    body: JSON.stringify(body),\n  });\n}",
+    "notes": [
+      "トークンを localStorage から HttpOnly Cookie へ移す。XSS が成立してもスクリプトからトークンを読み出せない。",
+      "`Secure` と `SameSite` を付ける。HTTPS 以外では送られず、他サイトからの遷移でも送られない。",
+      "Cookie に移すと CSRF が新たなリスクになるため、状態変更リクエストに CSRF トークンを併用する。",
+      "アクセストークンの寿命を15分に短縮し、漏洩した場合の悪用可能な時間を限定する。",
+      "リフレッシュトークンをDBに保持して失効可能にし、`path` を絞って送信先を限定する。",
+      "クライアントのコードからトークンを扱う処理が消える。触れないものは漏らせない。"
+    ]
+  },
+  "sec-4": {
+    "lang": "js",
+    "code": "// 既定値は「最も安全な状態」に置く。\n// 危険な設定は、権限を持つ人が意図的に有効化したときにだけ有効になる（opt-in）。\nconst SAFE_WORKSPACE_DEFAULTS = {\n  visibility: \"private\",       // 明示的に公開操作をするまで非公開\n  allowExternalShare: false,   // 社外共有は管理者が明示的に解禁する\n  defaultMemberRole: \"viewer\", // 最小権限。昇格は個別に行う\n  retentionDays: 365,          // 無期限保持をやめ、期限を既定で持つ\n  auditLogEnabled: true,       // 事後に追跡できないと、事故の範囲が確定できない\n};\n\nasync function createWorkspace({ name, ownerId, overrides = {}, actor }) {\n  // 既定から外れる設定は、誰がいつ有効にしたのかを記録する\n  const requestedUnsafe = Object.entries(overrides).filter(\n    ([key, value]) => SAFE_WORKSPACE_DEFAULTS[key] !== value\n  );\n\n  if (requestedUnsafe.length > 0) {\n    assertCanConfigureWorkspace(actor); // 危険な設定の変更には権限を要求する\n  }\n\n  const workspace = await db.workspace.create({\n    data: { name, ownerId, ...SAFE_WORKSPACE_DEFAULTS, ...overrides },\n  });\n\n  for (const [key, value] of requestedUnsafe) {\n    await auditLog.record({\n      event: \"workspace_unsafe_default_overridden\",\n      workspaceId: workspace.id,\n      actorId: actor.id,\n      setting: key,\n      value,\n    });\n  }\n\n  return workspace;\n}",
+    "notes": [
+      "既定値を安全側へ反転させる。大多数のユーザーは既定のまま使うので、既定値がそのまま組織全体のセキュリティ水準になる。",
+      "`visibility` を private にする。公開は取り消せても、公開されていた期間に見られた事実は取り消せない。",
+      "`defaultMemberRole` を viewer にする。最小権限から始めて必要なぶんだけ昇格するほうが、全員を管理者にしてから絞るより安全で運用も容易。",
+      "`auditLogEnabled` を既定で有効にする。監査ログは後から遡って有効化できないため、事故の後では手遅れになる。",
+      "危険な設定への変更に権限チェックを課し、変更内容を監査ログに残す。",
+      "既存のワークスペースにも同じ既定が入っているため、移行時に公開状態と権限の棚卸しを行う（このコードの範囲外だが必須の作業）。"
+    ]
+  },
+  "sec-5": {
+    "lang": "js",
+    "code": "// ORDER BY にはプレースホルダが使えないため、許可リストで列名を解決する。\nconst SORTABLE_COLUMNS = {\n  name: \"name\",\n  email: \"email\",\n  created_at: \"created_at\",\n};\n\nfunction escapeLike(input) {\n  // LIKE のワイルドカード自体を検索語として扱えるようにする\n  return input.replace(/[\\\\%_]/g, (c) => \"\\\\\" + c);\n}\n\nasync function searchUsers({ keyword, status, sort = \"created_at\", direction = \"desc\" }) {\n  const column = SORTABLE_COLUMNS[sort];\n  if (!column) {\n    throw new BadRequestError(`unsupported sort key: ${sort}`);\n  }\n  const order = direction === \"asc\" ? \"ASC\" : \"DESC\";\n\n  // 値はすべてプレースホルダで渡す。文字列連結でSQLを組み立てない。\n  return db.$queryRaw`\n    SELECT id, name, email, status\n    FROM users\n    WHERE name LIKE ${\"%\" + escapeLike(keyword) + \"%\"} ESCAPE '\\\\'\n      AND status = ${status}::user_status\n    ORDER BY ${db.raw(column)} ${db.raw(order)}\n    LIMIT 100\n  `;\n}\n\n// より単純に、ORMのクエリAPIで書けるならそれが最も安全\n// return db.user.findMany({\n//   where: { name: { contains: keyword }, status },\n//   orderBy: { [column]: direction },\n//   take: 100,\n//   select: { id: true, name: true, email: true, status: true },\n// });",
+    "notes": [
+      "`$queryRawUnsafe` の文字列連結をやめ、値をすべてプレースホルダで渡す。クォートを閉じて条件を差し込む攻撃が成立しなくなる。",
+      "`ORDER BY` はプレースホルダ化できないため、許可リストで列名を解決する。ユーザー入力を識別子としてSQLに載せない。",
+      "並び順も 'ASC'/'DESC' の2値に正規化し、任意の文字列が入らないようにする。",
+      "LIKE のワイルドカード（% と _）をエスケープし、検索語として正しく扱う。",
+      "取得列を明示し、パスワードハッシュなど不要な列を返さない。",
+      "「管理画面だから安全」は成り立たない。管理者アカウントの乗っ取り、内部不正、XSS経由の強制リクエストがあり、しかも管理画面は全会員情報に到達できるぶん被害が最も大きい。"
+    ]
+  },
+  "test-1": {
+    "lang": "js",
+    "code": "import { calculateTotal } from \"./cart\";\n\n// モックにするのは、制御しきれない外部依存だけ。\n// テスト対象そのものは必ず本物を呼ぶ。\nconst couponRepo = {\n  find: async (code) => (code === \"SAVE10\" ? { rate: 0.1 } : null),\n};\n\ntest(\"クーポンがあれば率に応じて割引される\", async () => {\n  const total = await calculateTotal({ subtotal: 1000 }, \"SAVE10\", { couponRepo });\n\n  // 期待値はベタ書きする。テスト側で実装と同じ計算式を書くと、\n  // 計算式が間違っていた場合に両方が同じように間違う。\n  expect(total).toBe(900);\n});\n\ntest(\"クーポンが存在しなければ割引されない\", async () => {\n  const total = await calculateTotal({ subtotal: 1000 }, \"NOPE\", { couponRepo });\n  expect(total).toBe(1000);\n});\n\ntest(\"クーポンコードが未指定なら割引されない\", async () => {\n  const total = await calculateTotal({ subtotal: 1000 }, undefined, { couponRepo });\n  expect(total).toBe(1000);\n});\n\n// 実装側は依存を引数で受け取れるようにしておく（テストのためだけでなく設計としても良い）\n//\n// export async function calculateTotal(cart, couponCode, { couponRepo }) {\n//   const coupon = couponCode ? await couponRepo.find(couponCode) : null;\n//   const discount = coupon ? Math.floor(cart.subtotal * coupon.rate) : 0;\n//   return cart.subtotal - discount;\n// }",
+    "notes": [
+      "テスト対象の関数を本物として import し、実際に実行する。モックを呼んでモックの戻り値を検証しても、何も確かめたことにならない。",
+      "モックの範囲を外部依存（クーポンの永続化層）だけに絞り、割引計算のロジックは本物を通す。",
+      "`toHaveBeenCalledWith` による呼び出し検証をやめる。呼び出し方ではなく結果を検証する（実装を変えても意味が変わらなければ落ちない）。",
+      "期待値をベタ書きする。テスト側で `subtotal * rate` を再現すると、計算式のバグを検出できない。",
+      "クーポン無し・未指定の分岐も追加する。カバレッジの数字ではなく、仕様の分岐を埋める。",
+      "依存を引数で受け取る形にして、グローバルのモンキーパッチ（`couponRepo.find = jest.fn()`）による他テストへの汚染を無くす。"
+    ]
+  },
+  "test-2": {
+    "lang": "js",
+    "code": "// 1) まず「落ちるテスト」を書き、落ちることを確認する。\n//    落ちないテストは、バグを捉えていない可能性がある。\ndescribe(\"calcShipping\", () => {\n  // 問い合わせ #1421: 僻地の注文で送料が二重に加算される\n  test(\"僻地の場合、僻地料金は1回だけ加算される\", () => {\n    const order = { isRemoteArea: true, items: [{ isOversized: false }] };\n    // 期待値は仕様から導いてベタ書きする（実装の式をテストで再現しない）\n    expect(calcShipping(order)).toBe(1500); // BASE 1000 + REMOTE 500\n  });\n\n  // 2) 報告された1ケースだけでなく、近接する条件も同時に固定する\n  test(\"僻地でも大型でもない場合は基本料金のみ\", () => {\n    expect(calcShipping({ isRemoteArea: false, items: [{ isOversized: false }] })).toBe(1000);\n  });\n\n  test(\"大型商品を含む場合は大型料金が加算される\", () => {\n    expect(calcShipping({ isRemoteArea: false, items: [{ isOversized: true }] })).toBe(1800);\n  });\n\n  test(\"僻地かつ大型の場合は両方が1回ずつ加算される\", () => {\n    expect(calcShipping({ isRemoteArea: true, items: [{ isOversized: true }] })).toBe(2300);\n  });\n\n  test(\"大型商品が複数あっても大型料金は1回だけ\", () => {\n    const order = { isRemoteArea: false, items: [{ isOversized: true }, { isOversized: true }] };\n    expect(calcShipping(order)).toBe(1800);\n  });\n});\n\n// 3) テストが落ちるのを見てから、実装の重複行を削除する。",
+    "notes": [
+      "修正の前に再現テストを書き、それが落ちることを確認する。この順序を守らないと、テストがバグを捉えているかを検証できない。",
+      "修正が自明であることと、再発防止が要ることは別の話。リファクタリングやマージで同じ行が復活しうる。",
+      "報告された1ケースだけでなく、条件の組み合わせ（僻地のみ／大型のみ／両方／どちらも無し）を同時に固定する。バグが出た箇所は仕様が複雑だった証拠なので、周辺ごと押さえる。",
+      "期待値を仕様から導いてベタ書きする。テスト側で実装の計算式を再現すると、同じ誤りを両方に書いてしまう。",
+      "「大型商品が複数でも加算は1回」のような、実装を読まないと気づかない仕様もテストとして残す。",
+      "テスト名に問い合わせ番号を残し、なぜこのテストがあるのかを後から辿れるようにする。"
+    ]
+  },
+  "test-4": {
+    "lang": "js",
+    "code": "import { setSystemTime, useFakeTimers } from \"./test-helpers\";\n\n// 時刻は固定する。実時間に依存したテストは、実行した瞬間によって結果が変わる。\nconst NOW = new Date(\"2025-07-15T09:00:00+09:00\");\n\nbeforeEach(async () => {\n  useFakeTimers();\n  setSystemTime(NOW);\n  // 各テストは自分が使うデータだけを前提にする（前のテストの残骸に依存しない）\n  await db.campaign.deleteMany({});\n});\n\nafterEach(() => {\n  jest.useRealTimers();\n});\n\ntest(\"キャンペーン期間中は割引が適用される\", async () => {\n  const campaign = await db.campaign.create({\n    data: {\n      code: \"SUMMER\",\n      startsAt: new Date(\"2025-07-01T00:00:00+09:00\"),\n      endsAt: new Date(\"2025-07-31T23:59:59+09:00\"),\n    },\n  });\n\n  const result = await applyCampaign({ subtotal: 1000 }, \"SUMMER\");\n\n  expect(result.discounted).toBe(true);\n  // 「テーブル全体が1件」ではなく、自分が作ったデータについて検証する\n  expect(await db.campaign.count({ where: { id: campaign.id } })).toBe(1);\n});\n\ntest(\"期間終了の直後は割引が適用されない（境界）\", async () => {\n  setSystemTime(new Date(\"2025-08-01T00:00:00+09:00\"));\n  await db.campaign.create({\n    data: {\n      code: \"SUMMER\",\n      startsAt: new Date(\"2025-07-01T00:00:00+09:00\"),\n      endsAt: new Date(\"2025-07-31T23:59:59+09:00\"),\n    },\n  });\n\n  const result = await applyCampaign({ subtotal: 1000 }, \"SUMMER\");\n\n  expect(result.discounted).toBe(false);\n});",
+    "notes": [
+      "`new Date()` への依存をやめ、システム時刻を固定する。日付の変わり目・タイムゾーン・夏時間で結果が揺れなくなる。",
+      "キャンペーンの期間を固定日時で明示する。「今日から7日間」ではテストが何を検証しているのか読めない。",
+      "各テストの前にデータを片付け、他のテストの残骸に依存しないようにする。並列実行でも壊れない。",
+      "`count()` の対象を「テーブル全体」から「自分が作ったレコード」に変える。共有状態への暗黙の前提を消す。",
+      "時刻を固定できたことで、境界（期間終了直後）のテストが初めて書けるようになる。",
+      "再実行で緑になるテストを放置すると、本物の不具合が出た時も「またフレーキーだろう」と無視されるようになる。直すか消すかの二択で扱う。"
+    ]
+  },
+  "test-5": {
+    "lang": "js",
+    "code": "// 仕様: 購入金額が 5,000円「以上」で送料無料\nconst FREE_SHIPPING_THRESHOLD = 5000;\nconst SHIPPING_FEE = 500;\n\nfunction shippingFee(subtotal) {\n  return subtotal >= FREE_SHIPPING_THRESHOLD ? 0 : SHIPPING_FEE;\n}\n\ndescribe(\"shippingFee\", () => {\n  // 境界そのもの・直前・直後の3点を押さえる\n  test.each([\n    [4999, SHIPPING_FEE], // 境界の直前\n    [5000, 0],            // 境界そのもの（仕様が「以上」であることを固定する）\n    [5001, 0],            // 境界の直後\n  ])(\"小計 %i 円のとき送料は %i 円\", (subtotal, expected) => {\n    expect(shippingFee(subtotal)).toBe(expected);\n  });\n\n  // 境界から離れた代表値\n  test(\"十分に少額なら送料がかかる\", () => {\n    expect(shippingFee(3000)).toBe(SHIPPING_FEE);\n  });\n\n  test(\"十分に高額なら送料は無料\", () => {\n    expect(shippingFee(100000)).toBe(0);\n  });\n\n  // 異常系\n  test(\"0円のときは送料がかかる\", () => {\n    expect(shippingFee(0)).toBe(SHIPPING_FEE);\n  });\n});",
+    "notes": [
+      "実装の `>` を仕様どおりの `>=` に修正する。境界の1点だけが仕様とずれていた。",
+      "境界そのもの（5000）・直前（4999）・直後（5001）の3点をテストで固定する。この3点が無ければ `>` と `>=` の違いは検出できない。",
+      "閾値と送料を名前つき定数にする。テストと実装の両方から同じ定数を参照でき、金額変更が1箇所で済む。",
+      "`test.each` で境界の表を作り、ケースの追加を1行で行えるようにする。",
+      "0円のような異常系も加える。ただし、まず押さえるべきは仕様の分岐点そのもの。",
+      "テスト名に仕様の言葉（以上／無料）を残し、テストが仕様の記録として読めるようにする。"
+    ]
+  },
+  "rel-1": {
+    "lang": "js",
+    "code": "import { randomUUID } from \"node:crypto\";\n\n// エラーの詳細はサーバーのログへ。クライアントには追跡IDだけを返す。\napp.use((err, req, res, next) => {\n  if (res.headersSent) {\n    return next(err); // 送信済みなら Express の既定ハンドラに委ねる\n  }\n\n  const traceId = req.traceId ?? randomUUID();\n  const status = err.statusCode ?? 500;\n\n  // 構造化ログ。調査に必要な文脈は全てこちら側に残す。\n  logger.error({\n    event: \"unhandled_error\",\n    traceId,\n    status,\n    method: req.method,\n    path: req.path,\n    userId: req.user?.id,\n    err: { name: err.name, message: err.message, stack: err.stack },\n  });\n\n  // 想定内のエラー（4xx）だけはメッセージを返してよい。\n  // 500 は内部の情報を含みうるので、固定文言に置き換える。\n  const body =\n    status < 500\n      ? { error: err.publicMessage ?? err.message, traceId }\n      : { error: \"サーバー内部でエラーが発生しました\", traceId };\n\n  res.status(status).json(body);\n});",
+    "notes": [
+      "`process.env` の返却を廃止する。環境変数にはDB接続文字列・APIキー・署名用シークレットが入っており、これを返すのは鍵束を配るのと同じ。",
+      "`err.stack` と `err.query` をレスポンスから外す。ファイル構成・使用ライブラリ・テーブル名は攻撃の下調べに直接使われる。",
+      "追跡ID（traceId）を発行し、クライアントとサーバーログを紐づける。調査のしやすさは、機密を返さずとも確保できる。",
+      "4xx と 5xx を区別する。想定内のエラーはメッセージを返してよいが、500 は固定文言に置き換える。",
+      "`console.error` を構造化ロガーに置き換え、traceId・パス・ユーザーIDで検索できるようにする。",
+      "`res.headersSent` を確認し、送信後の二重レスポンスで別のエラーを起こさないようにする。"
+    ]
+  },
+  "rel-3": {
+    "lang": "sql",
+    "code": "-- 破壊的な変更は expand / migrate / contract の3段階に分ける。\n-- 各段階は単独でデプロイでき、1つ前のバージョンのコードでも動く。\n\n-- === 段階1: expand（デプロイ #1 の前に実行）===\n-- 新しい列を追加するだけ。旧コードは full_name を読み書きし続けられる。\nALTER TABLE users ADD COLUMN display_name TEXT;\n\n-- 既存データをコピー（大きなテーブルではバッチで分割する）\nUPDATE users SET display_name = full_name WHERE display_name IS NULL;\n\n-- 移行期間中、どちらの列に書かれても両方が同じ値になるようにする\nCREATE FUNCTION sync_user_name() RETURNS trigger AS $$\nBEGIN\n  IF NEW.display_name IS DISTINCT FROM OLD.display_name THEN\n    NEW.full_name := NEW.display_name;\n  ELSIF NEW.full_name IS DISTINCT FROM OLD.full_name THEN\n    NEW.display_name := NEW.full_name;\n  END IF;\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nCREATE TRIGGER users_sync_name\n  BEFORE INSERT OR UPDATE ON users\n  FOR EACH ROW EXECUTE FUNCTION sync_user_name();\n\n-- === 段階2: migrate（デプロイ #1）===\n-- アプリを display_name の読み書きに切り替える。\n-- 旧インスタンスが full_name を使っていてもトリガが同期するので壊れない。\n-- 全インスタンスの入れ替え完了を確認し、full_name への参照が消えたことを\n-- ログ・メトリクスで確かめてから次へ進む。\n\n-- === 段階3: contract（デプロイ #2 のあと、日をあけて実行）===\nDROP TRIGGER users_sync_name ON users;\nDROP FUNCTION sync_user_name();\nALTER TABLE users DROP COLUMN full_name;",
+    "notes": [
+      "改名（RENAME）を「追加 → 移行 → 削除」の3段階に分解する。ローリングアップデート中は新旧のコードが必ず同居するため、どちらのコードでも動く状態を経由させる。",
+      "段階1では列を追加するだけなので、旧コードは一切影響を受けない。ここで失敗しても切り戻しは不要。",
+      "移行期間中はトリガで両方の列を同期し、どちらのコードが書いても値がずれないようにする。",
+      "段階2のデプロイは、いつでも1つ前のバージョンへ戻せる。切り戻しの経路が常に確保されている点が要点。",
+      "段階3は全インスタンスの入れ替えを確認してから、日をあけて実行する。旧列の削除だけは取り返しがつかない。",
+      "既存データのコピーは大きなテーブルではバッチに分割する。1つの巨大なUPDATEはロックとレプリケーション遅延を招く。"
+    ]
+  },
+  "rel-4": {
+    "lang": "js",
+    "code": "// 許可するオリジンは環境変数で明示し、一致しないものは拒否する。\nconst ALLOWED_ORIGINS = new Set(\n  (process.env.CORS_ALLOWED_ORIGINS ?? \"\")\n    .split(\",\")\n    .map((o) => o.trim())\n    .filter(Boolean)\n);\n\napp.use(\n  cors({\n    origin: (requestOrigin, callback) => {\n      // Origin ヘッダの無いリクエスト（サーバー間、curl、同一オリジン）は\n      // CORS の対象外なので、そのまま通してよい\n      if (!requestOrigin) return callback(null, true);\n\n      if (ALLOWED_ORIGINS.has(requestOrigin)) {\n        return callback(null, true);\n      }\n\n      logger.warn({ event: \"cors_origin_rejected\", origin: requestOrigin });\n      return callback(null, false); // 許可ヘッダを返さない = ブラウザが読み取りを拒否する\n    },\n    credentials: true,\n    methods: [\"GET\", \"POST\", \"PUT\", \"PATCH\", \"DELETE\"],\n    allowedHeaders: [\"Content-Type\", \"Authorization\", \"X-CSRF-Token\"],\n    maxAge: 600, // プリフライトの結果をキャッシュしてラウンドトリップを減らす\n  })\n);\n\n// .env.production\n//   CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com\n//\n// モバイルアプリは Origin を送らないため、CORS で守る対象ではない。\n// ネイティブからのアクセスは認証とレート制限で守る。",
+    "notes": [
+      "リクエスト元をそのまま反射する実装をやめ、環境変数で定義した許可リストと照合する。`credentials: true` と全オリジン許可の組み合わせは、同一オリジンポリシーを丸ごと無効化する。",
+      "許可リストを環境変数に置き、開発・ステージング・本番でオリジンを切り替えられるようにする。コードに直書きすると、開発用のオリジンが本番に残る。",
+      "Origin ヘッダの無いリクエストは CORS の対象外なので素通しでよい。モバイルアプリのために全オリジンを開ける必要はない。",
+      "拒否したオリジンをログに残し、想定外のクライアントや攻撃の兆候を検知できるようにする。",
+      "`maxAge` でプリフライトをキャッシュし、設定を厳しくしたことによるラウンドトリップの増加を抑える。",
+      "CORS はレスポンスの読み取り可否の宣言であり、CSRF 対策の代わりにはならない。CSRF トークンは別途必要。"
+    ]
+  },
+  "rel-5": {
+    "lang": "bash",
+    "code": "#!/bin/bash\n# deploy.sh\nset -Eeuo pipefail   # 未定義変数とパイプ途中の失敗でも止める\n\nREVISION=\"${1:?デプロイするタグまたはコミットハッシュを指定してください}\"\nAPP_DIR=/srv/app\nBACKUP_DIR=/var/backups/app\n\n# 1) 何を出すのかを固定する（その時点の main を取らない）\ncd \"$APP_DIR\"\ngit fetch --tags origin\ngit checkout --detach \"$REVISION\"\necho \"deploying: $(git rev-parse --short HEAD)\"\n\n# 2) 依存はロックファイルどおりに入れる（デプロイ時に解決させない）\nnpm ci\n\n# 3) 出す前に落とす（テスト・型・Lint を経路に組み込む）\nnpm run lint\nnpm run typecheck\nnpm test\n\nnpm run build\n\n# 4) 秘密情報はリポジトリに置かない。実行環境の環境変数から読む。\n: \"${DATABASE_URL:?DATABASE_URL が未設定です}\"\n: \"${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY が未設定です}\"\n\n# 5) マイグレーションの前に必ずバックアップを取る\nmkdir -p \"$BACKUP_DIR\"\nBACKUP_FILE=\"$BACKUP_DIR/$(date +%Y%m%d-%H%M%S).dump\"\npg_dump --format=custom \"$DATABASE_URL\" > \"$BACKUP_FILE\"\necho \"backup: $BACKUP_FILE\"\n\nnpm run migrate\n\n# 6) 入れ替えたら、生きていることを確認する\npm2 reload app --update-env\n\nfor i in $(seq 1 30); do\n  if curl -fsS --max-time 3 http://127.0.0.1:3000/healthz > /dev/null; then\n    echo \"healthy: $(git rev-parse --short HEAD)\"\n    exit 0\n  fi\n  sleep 2\ndone\n\necho \"ヘルスチェックに失敗しました。切り戻してください:\" >&2\necho \"  ./deploy.sh <直前のタグ>  /  pg_restore --clean -d \\\"$DATABASE_URL\\\" $BACKUP_FILE\" >&2\nexit 1",
+    "notes": [
+      "本番の秘密情報をリポジトリの .env から実行環境の環境変数へ移す。`.env.production` をコミットしている時点で、リポジトリを読める全員が本番の鍵を持っている（履歴からの削除と鍵のローテーションも必要）。",
+      "`git pull origin main` をタグ／コミット指定に変える。「何を出したのか」が特定できないデプロイは、切り戻しも原因調査もできない。",
+      "`npm install` を `npm ci` にする。ロックファイルどおりに入れ、デプロイのたびに依存が変わるのを防ぐ。",
+      "Lint・型チェック・テストをデプロイ経路に組み込む。CIで通っていても、実際に出るものが同じ検証を通った保証にはならない。",
+      "マイグレーション前にバックアップを取る。マイグレーションは失敗しても前に戻れない操作を含む。",
+      "`pm2 restart` を `reload` にし、ヘルスチェックで生存を確認する。デプロイの完了は「プロセスが起動したこと」ではなく「リクエストに応えられること」。",
+      "失敗時に切り戻し手順を出力する。障害の最中に手順を思い出さなくて済むようにする。",
+      "`set -Eeuo pipefail` で未定義変数とパイプ途中の失敗も検知する。"
+    ]
+  }
+}

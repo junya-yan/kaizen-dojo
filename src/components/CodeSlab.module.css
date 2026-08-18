@@ -1,0 +1,99 @@
+.slab {
+  margin: 0 0 18px;
+  border: 1px solid var(--slab-rule);
+  background: var(--slab-bg);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--slab-rule);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.header :global(.label) {
+  color: #8b98a6;
+}
+
+.headerPass {
+  border-bottom-color: rgba(47, 109, 79, 0.55);
+  background: rgba(47, 109, 79, 0.18);
+}
+
+.headerPass :global(.label) {
+  color: #8fc9a9;
+}
+
+.badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: #6f7d8c;
+}
+
+.headerPass .badge {
+  color: #8fc9a9;
+}
+
+/* 長い行があっても崩れないよう、コードブロック内だけを横スクロールさせる */
+.scroller {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.pre {
+  display: inline-block;
+  min-width: 100%;
+  margin: 0;
+  padding: 12px 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--slab-ink);
+  tab-size: 2;
+}
+
+.line {
+  display: flex;
+}
+
+.lineNo {
+  flex: none;
+  padding-right: 12px;
+  padding-left: 14px;
+  color: #4a5867;
+  text-align: right;
+  user-select: none;
+}
+
+.lineBody {
+  flex: 1;
+  padding-right: 16px;
+  white-space: pre;
+}
+
+.comment {
+  color: #6d7f8e;
+  font-style: italic;
+}
+
+.string {
+  color: #b7d39a;
+}
+
+.number {
+  color: #e0b070;
+}
+
+.keyword {
+  color: #7fb4e0;
+}
+
+.plain {
+  color: inherit;
+}
