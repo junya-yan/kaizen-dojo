@@ -1,0 +1,224 @@
+.card {
+  margin-top: 20px;
+}
+
+.inputLabel {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.textarea {
+  display: block;
+  width: 100%;
+  padding: 14px 15px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid var(--rule);
+  resize: vertical;
+  line-height: 1.9;
+}
+
+.textarea::placeholder {
+  color: var(--ink-muted);
+}
+
+.textarea:disabled {
+  opacity: 0.7;
+}
+
+.meta {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+.error {
+  margin-top: 14px;
+  padding: 12px 15px;
+  border-left: 4px solid var(--stamp-red);
+  background: rgba(194, 53, 43, 0.07);
+}
+
+.errorText {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: var(--ink-sub);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.primary {
+  padding: 11px 26px;
+  background: var(--ink);
+  color: var(--paper);
+  border: none;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+.primary:hover:not(:disabled) {
+  background: #223142;
+}
+
+.primary:disabled {
+  background: var(--ink-muted);
+  opacity: 0.55;
+}
+
+.ghost {
+  padding: 11px 20px;
+  background: transparent;
+  border: 1px solid var(--rule);
+  color: var(--ink-sub);
+}
+
+.ghost:hover {
+  border-color: var(--ink-sub);
+}
+
+.next {
+  padding: 11px 26px;
+  background: var(--ink);
+  color: var(--paper);
+  border: none;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+.next:hover {
+  background: #223142;
+}
+
+.result {
+  margin-top: 4px;
+}
+
+.scoreRow {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.score {
+  margin: 2px 0 0;
+  font-size: 46px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.scoreUnit {
+  margin-left: 8px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--ink-muted);
+}
+
+.verdict {
+  margin: 0;
+  padding: 5px 16px;
+  border: 2px solid;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+.bar {
+  height: 4px;
+  margin: 14px 0 20px;
+  background: var(--paper-shade);
+}
+
+.barFill {
+  height: 100%;
+  transition: width 400ms ease;
+}
+
+.comment {
+  margin: 0 0 20px;
+  color: var(--ink-sub);
+}
+
+.section {
+  margin-bottom: 18px;
+}
+
+.covered {
+  color: var(--stamp-green);
+}
+
+.missed {
+  color: var(--stamp-red);
+}
+
+.list {
+  margin: 6px 0 0;
+  padding-left: 1.2em;
+  font-size: 14px;
+  color: var(--ink-sub);
+}
+
+.list li {
+  margin-bottom: 6px;
+}
+
+.list li::marker {
+  color: var(--ink-muted);
+}
+
+.nextStep {
+  padding: 13px 16px;
+  border: 1px solid var(--ink);
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.nextStep :global(.label) {
+  color: var(--ink-sub);
+}
+
+.nextStepText {
+  margin: 4px 0 0;
+  font-weight: 500;
+}
+
+.selfCheckNote {
+  margin: 0 0 16px;
+  padding: 12px 15px;
+  border-left: 4px solid var(--ink-muted);
+  background: rgba(255, 255, 255, 0.5);
+  font-size: 14px;
+  color: var(--ink-sub);
+}
+
+.rubric {
+  margin-top: 22px;
+  padding: 12px 15px;
+  border: 1px solid var(--rule);
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.rubricSummary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.rubricSummary::-webkit-details-marker {
+  display: none;
+}
+
+.rubricSummary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 8px;
+  color: var(--ink-muted);
+  transition: transform 120ms ease;
+}
+
+.rubric[open] .rubricSummary::before {
+  transform: rotate(90deg);
+}

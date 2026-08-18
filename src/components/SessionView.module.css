@@ -1,0 +1,111 @@
+.page {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 32px 20px 80px;
+}
+
+.topBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.back {
+  padding: 4px 0;
+  background: none;
+  border: none;
+  color: var(--ink-sub);
+  font-size: 13px;
+}
+
+.back:hover {
+  color: var(--ink);
+}
+
+.counter {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: var(--ink-muted);
+}
+
+.progress {
+  height: 2px;
+  background: var(--rule);
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--ink);
+  transition: width 260ms ease;
+}
+
+.header {
+  margin: 22px 0 18px;
+}
+
+.tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.severity {
+  padding: 3px 10px;
+  border: 1px solid;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+.critical {
+  color: var(--stamp-red);
+  border-color: var(--stamp-red);
+  background: rgba(194, 53, 43, 0.07);
+}
+
+.major {
+  color: var(--stamp-amber);
+  border-color: var(--stamp-amber);
+  background: rgba(168, 116, 31, 0.08);
+}
+
+.minor {
+  color: var(--ink-sub);
+  border-color: var(--rule);
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.tagText {
+  color: var(--ink-muted);
+}
+
+/* 状況説明は引用スタイル（左罫線） */
+.situation {
+  margin: 0 0 20px;
+  padding: 2px 0 2px 16px;
+  border-left: 2px solid var(--rule);
+  color: var(--ink-sub);
+  font-size: 14px;
+  white-space: pre-wrap;
+}
+
+.prompt {
+  margin: 22px 0 0;
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1.6;
+}
+
+@media (max-width: 560px) {
+  .page {
+    padding: 24px 16px 64px;
+  }
+
+  .prompt {
+    font-size: 17px;
+  }
+}

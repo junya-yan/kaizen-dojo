@@ -1,0 +1,101 @@
+/*
+ * 検査票・帳票をモチーフにしたデザイントークン。
+ * 色とフォントは要件定義書 4.1 の指定をそのまま持ってきている。
+ */
+:root {
+  --paper: #e9ebe6;
+  --paper-shade: #dde0d9;
+  --ink: #16202b;
+  --ink-sub: #48545f;
+  --ink-muted: #78837b;
+  --rule: #c3c8be;
+  --stamp-red: #c2352b;
+  --stamp-green: #2f6d4f;
+  --stamp-amber: #a8741f;
+  --slab-bg: #1b2430;
+  --slab-rule: #2b3746;
+  --slab-ink: #d6dde5;
+
+  --font-sans: var(--font-zen-kaku), "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+  --font-mono: var(--font-mplus-code), "SFMono-Regular", Consolas, monospace;
+
+  --rule-gap: 28px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.85;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+
+  /* 紙に薄い横罫線が入ったテクスチャ */
+  background-color: var(--paper);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent calc(var(--rule-gap) - 1px),
+    rgba(120, 131, 123, 0.18) calc(var(--rule-gap) - 1px),
+    rgba(120, 131, 123, 0.18) var(--rule-gap)
+  );
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+/* 帳票のラベル。等幅・字間広め・小さめ */
+.label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

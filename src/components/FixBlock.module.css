@@ -1,0 +1,29 @@
+.block {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--rule);
+}
+
+.heading {
+  margin: 0 0 10px;
+}
+
+.notesLabel {
+  margin: 0 0 6px;
+  color: var(--stamp-green);
+}
+
+.notes {
+  margin: 0;
+  padding-left: 1.2em;
+  color: var(--ink-sub);
+  font-size: 14px;
+}
+
+.notes li {
+  margin-bottom: 6px;
+}
+
+.notes li::marker {
+  color: var(--ink-muted);
+}
