@@ -26,6 +26,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # リポジトリでGitHub Pagesがまだ有効化されていない場合、pages: write権限を使って
+      # このステップが自動で有効化する（Source: GitHub Actions として作成される）。
+      # 「Settings → Pages」を手動で先に触らなくても、初回からデプロイが通るようにするため。
+      # ビルドより前に置き、有効化できない場合（組織のポリシーなど）に早く気づけるようにする。
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
